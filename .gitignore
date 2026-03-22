@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Mac
+.DS_Store
+
+# Environment
+.env
+
+# Virtual environment
+.venv/
+venv/
+# Tests cache
+.pytest_cache/google-credentials.json
