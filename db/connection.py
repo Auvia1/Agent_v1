@@ -1,20 +1,43 @@
+#db/connection.py
 import os
 import asyncpg
 from loguru import logger
 from db.queries import cleanup_expired_pending_appointments
-
+ 
+_pool = None  # singleton — created once, reused forever
+ 
+ 
 async def get_db_pool():
+    global _pool
+    if _pool is not None:
+        return _pool  # ← already exists, return immediately
     try:
-        pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+        _pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
         logger.info("✅ Database pool created successfully.")
-        
-        # 🔥 Run the 15-minute cleanup sweep immediately on boot
-        await cleanup_expired_pending_appointments(pool)
-        
-        return pool
+        await cleanup_expired_pending_appointments(_pool)  # runs ONCE at startup
+        return _pool
     except Exception as e:
         logger.error(f"❌ Failed to connect to database: {e}")
         raise
+ 
+#prev code
+# import os
+# import asyncpg
+# from loguru import logger
+# from db.queries import cleanup_expired_pending_appointments
+
+# async def get_db_pool():
+#     try:
+#         pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+#         logger.info("✅ Database pool created successfully.")
+        
+#         # 🔥 Run the 15-minute cleanup sweep immediately on boot
+#         await cleanup_expired_pending_appointments(pool)
+        
+#         return pool
+#     except Exception as e:
+#         logger.error(f"❌ Failed to connect to database: {e}")
+#         raise
 
 # import os
 # import ssl

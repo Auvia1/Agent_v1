@@ -1,3 +1,4 @@
+#db/queries.py
 from loguru import logger
 
 async def cleanup_expired_pending_appointments(pool):
