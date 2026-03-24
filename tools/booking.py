@@ -169,8 +169,6 @@
 #     # 4. Passed all checks -> Proceed to actual booking
 #     await _execute_booking(params, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup_bool)
 
-
-
 import os
 import datetime
 import asyncio
@@ -277,6 +275,10 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
 # ==========================================================
 async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: str = "unknown"):
     """Gatekeeper — runs safety checks before actual booking."""
+    
+    # ✅ FIX: Declare the variable securely before any logic or try blocks!
+    is_followup_bool = False
+
     clean_phone = "".join(filter(str.isdigit, str(phone)))
     if clean_phone.startswith("91") and len(clean_phone) == 12:
         clean_phone = clean_phone[2:]
@@ -321,7 +323,6 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
             """
             has_recent = await conn.fetchrow(followup_query, clean_phone)
  
-            is_followup_bool = False
             if is_followup == "unknown":
                 if has_recent:
                     recent_date = has_recent['appointment_start'].astimezone(pytz.timezone('Asia/Kolkata')).strftime('%B %d')

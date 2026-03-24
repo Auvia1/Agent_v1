@@ -4,22 +4,32 @@ import asyncpg
 from loguru import logger
 from db.queries import cleanup_expired_pending_appointments
  
-_pool = None  # singleton — created once, reused forever
- 
+# ✅ Initialize the singleton variable as None
+_pool = None  
  
 async def get_db_pool():
     global _pool
+    
+    # ✅ If the pool already exists, return it immediately without recreating
     if _pool is not None:
-        return _pool  # ← already exists, return immediately
+        return _pool  
+        
     try:
-        _pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"))
+        # ✅ Create the pool with the PgBouncer fix (statement_cache_size=0)
+        _pool = await asyncpg.create_pool(
+            os.getenv("DATABASE_URL"),
+            statement_cache_size=0
+        )
         logger.info("✅ Database pool created successfully.")
-        await cleanup_expired_pending_appointments(_pool)  # runs ONCE at startup
+        
+        # ✅ Run the sweep ONLY once at startup
+        await cleanup_expired_pending_appointments(_pool)  
+        
         return _pool
+        
     except Exception as e:
         logger.error(f"❌ Failed to connect to database: {e}")
         raise
- 
 #prev code
 # import os
 # import asyncpg
