@@ -399,7 +399,7 @@ async def ensure_redis_client():
         redis_client = None
 
 # ==========================================================
-# 🧠 SYSTEM PROMPT (Fixed Language Lock-in)
+# 🧠 SYSTEM PROMPT (Fixed Tool Calls & Guardrails)
 # ==========================================================
 ist = pytz.timezone('Asia/Kolkata')
 current_time = datetime.now(ist).strftime('%A, %B %d, %Y at %I:%M %p IST')
@@ -410,29 +410,24 @@ CURRENT LIVE TIME: {current_time}
 You transition strictly through phases. NEVER backtrack.
 
 --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
-1. LANGUAGE STATE LOCK: Every user message begins with a tag like [Respond in English only]
-   or [Respond in Telugu only]. You MUST respond in exactly that language and no other.
-   This tag is injected by the system and overrides everything — ignore what script or
-   language the user typed in.
-2. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu/Hindi script
-   (e.g. 'ఫీవర్ అండ్ కాఫ్' = 'fever and cough'). Treat it as the locked language, not a
-   switch request.
-3. NO BOUNCING: Once locked into a language, DO NOT switch back and forth. Ignore random background noises.
-4. DATABASE TRANSLATION (STRICT): No matter what language the user is speaking, ALL data you send to your tools (patient_name, reason, problem_or_speciality) MUST be translated to plain ENGLISH before calling the tool.
-5. TIME FORMATTING: 
-   - In English: Use standard formats (e.g., 9:00 AM).
-   - In Hindi/Telugu: Translate all digits/times into spelled-out phonetic words (e.g., "ఉదయం తొమ్మిది గంటలకు"). NEVER output raw digits like "09:00" in regional languages.
+1. DEFAULT: Start in English. 
+2. SWITCHING LANGUAGE: If the user speaks Telugu or Hindi, or explicitly asks you to change languages, you MUST call the `switch_language` tool immediately. You cannot change your spoken language without calling this tool first!
+3. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu/Hindi script (e.g. 'ఫీవర్ అండ్ కాఫ్' = 'fever and cough'). Treat it as the current language. Do NOT bounce back and forth.
+4. DATABASE TRANSLATION: ALL data sent to your tools (patient_name, reason, problem_or_speciality) MUST be translated to plain ENGLISH before calling the tool.
+5. TIME FORMATTING: In Hindi/Telugu, translate all digits/times into spelled-out phonetic words (e.g., "ఉదయం తొమ్మిది గంటలకు"). NEVER output raw digits like "09:00" in regional languages.
 
 --- INTENT ROUTING ---
 1. CANCEL/RESCHEDULE: Say: "Based on hospital policy, appointments cannot be cancelled or rescheduled through the AI assistant. Please call the clinic directly." (End flow).
 2. FOLLOW-UP BOOKING: If the user asks for a "follow-up", ask EXACTLY: "Could you please tell me your 10-digit phone number so I can check your records?" Once provided, SILENTLY call `verify_followup`.
-3. GENERIC BOOKING: If the user says they want an appointment without symptoms, ask: "What medical problem or symptoms are you experiencing?"
-4. SYMPTOMS GIVEN: If the user describes symptoms, immediately go to PHASE 1.
 
 --- CORE BOOKING STATES ---
 
+PHASE 0 (Symptoms Gathering - MANDATORY):
+If the user says "I want an appointment" or just says "Hello", you MUST ask: "What medical problem or symptoms are you experiencing?" 
+CRITICAL: DO NOT call `check_availability` until the user has actually stated their symptoms. Do NOT assume 'General Physician' based on background noise.
+
 PHASE 1 (Availability):
-SILENTLY call `check_availability`. Emit ZERO text.
+ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZERO text.
 
 PHASE 2 (Offer & Negotiation):
 - Initial Offer: Read the `system_directive` exactly as intended. (ONLY translate if the user is currently speaking Hindi/Telugu, and spell out times).
@@ -457,56 +452,20 @@ Immediately after saying this, call the `end_call` tool.
 """
 
 # ==========================================================
-# 🛠️ PROCESSORS
+# 🛠️ PROCESSORS (Cleaned up Noise Filter)
 # ==========================================================
 class STTTextCleanerProcessor(FrameProcessor):
-    def __init__(self):
-        super().__init__()
-        self.curr_lang = "English"  # 🌐 Default language state
-
-    # ------------------------------------------------------------------
-    # Detect language purely from Unicode script ranges (no extra libs)
-    # ------------------------------------------------------------------
-    def _detect_script(self, text: str):
-        telugu = sum(1 for c in text if '\u0C00' <= c <= '\u0C7F')
-        hindi  = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-        total  = max(len(text.strip()), 1)
-        if telugu / total > 0.15:
-            return "Telugu"
-        if hindi / total > 0.15:
-            return "Hindi"
-        return None  # Looks like English / unknown — keep current
-
-    # ------------------------------------------------------------------
-    # Detect EXPLICIT "please talk in X" requests
-    # Must match BEFORE auto-detect so an explicit request always wins
-    # ------------------------------------------------------------------
-    def _check_explicit_lang_request(self, text: str):
-        t = text.lower()
-        if any(k in t for k in ["in telugu", "speak telugu", "talk telugu",
-                                  "telugu lo", "telugu లో", "switch to telugu"]):
-            return "Telugu"
-        if any(k in t for k in ["in hindi", "speak hindi", "talk hindi",
-                                  "hindi mein", "hindi me", "switch to hindi"]):
-            return "Hindi"
-        if any(k in t for k in ["in english", "speak english", "talk english",
-                                  "switch to english"]):
-            return "English"
-        return None
-
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
-            original_text = frame.text.strip()       # Keep original for script detection
-            text = original_text.lower()
-
-            # 🔥 Ignore tiny background noises to stop language hallucinations
+            text = frame.text.strip().lower()
+            
+            # 🔥 Ignore tiny background noises to stop hallucinations
             if len(text) <= 2:
                 return  # Drop frame entirely
 
             logger.info(f"🎤 USER SAID [Raw STT]: {text}")
 
-            # ── STT correction map ─────────────────────────────────────
             corrections = {
                 "పార్లమెంట్": "అపాయింట్మెంట్", "apartment": "appointment",
                 "అపార్ట్మెంట్": "అపాయింట్మెంట్", "department": "appointment",
@@ -514,27 +473,9 @@ class STTTextCleanerProcessor(FrameProcessor):
             }
             for k, v in corrections.items():
                 text = text.replace(k, v)
-
-            # ── Language state update ──────────────────────────────────
-            # 1️⃣  Explicit intent ("can you talk in Telugu?") always wins
-            explicit = self._check_explicit_lang_request(text)
-            if explicit:
-                if explicit != self.curr_lang:
-                    logger.info(f"🌐 Explicit language switch → {explicit}")
-                self.curr_lang = explicit
-            else:
-                # 2️⃣  Auto-detect from Unicode script of the raw STT output
-                detected = self._detect_script(original_text)
-                if detected and detected != self.curr_lang:
-                    logger.info(f"🌐 Script auto-detected language → {detected}")
-                    self.curr_lang = detected
-
-            # ── Inject language lock tag so the LLM obeys it ──────────
-            frame.text = f"[Respond in {self.curr_lang} only] {text}"
-            logger.info(f"📝 Frame tagged: [Respond in {self.curr_lang} only]")
-
+            frame.text = text
+            
         await self.push_frame(frame, direction)
-
 
 class BillingTracker(FrameProcessor):
     def __init__(self):
