@@ -130,25 +130,45 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
         pool = get_pool()  # ✅ reuse singleton
         async with pool.acquire() as conn:
             
-            # 🔥 NEW INTERCEPT 1: Family / Name Confirmation Check
             clinic_id_query = "SELECT clinic_id FROM doctors WHERE id = $1::uuid"
             clinic_id = await conn.fetchval(clinic_id_query, doctor_id)
             
-            patient_check_query = "SELECT id, name FROM patients WHERE phone = $1 AND clinic_id = $2::uuid LIMIT 1"
-            existing_p = await conn.fetchrow(patient_check_query, clean_phone, clinic_id)
+            # 🔥 NEW INTERCEPT 1: Fetch ALL family members with this phone number!
+            patient_check_query = "SELECT id, name FROM patients WHERE phone = $1 AND clinic_id = $2::uuid"
+            existing_patients = await conn.fetch(patient_check_query, clean_phone, clinic_id)
             
-            if existing_p:
-                db_name = existing_p['name']
-                existing_patient_id = str(existing_p['id'])
+            if existing_patients:
+                db_names = [p['name'] for p in existing_patients]
+                names_str = ", ".join(db_names)
                 
-                # If names are vaguely different and we haven't explicitly asked yet
-                if is_same_patient == "unknown" and patient_name.lower() not in db_name.lower() and db_name.lower() not in patient_name.lower():
-                    logger.warning(f"🛑 SMART INTERCEPT: Name mismatch. DB: {db_name}, Input: {patient_name}")
-                    await params.result_callback({
-                        "status": "warning", 
-                        "message": f"SYSTEM DIRECTIVE: Tell the user: 'We already have a patient named {db_name} registered with this phone number. Are you the same person updating your name, or a new family member?'"
-                    })
-                    return
+                # Check for an exact or fuzzy match
+                best_match_id = None
+                for p in existing_patients:
+                    db_name_lower = p['name'].lower()
+                    input_name_lower = patient_name.lower()
+                    if db_name_lower == input_name_lower or db_name_lower in input_name_lower or input_name_lower in db_name_lower:
+                        best_match_id = str(p['id'])
+                        break
+                
+                if is_same_patient == "unknown":
+                    # If the name is totally new, ask the family question!
+                    if not best_match_id:
+                        logger.warning(f"🛑 SMART INTERCEPT: Family mismatch. DB: {names_str}, Input: {patient_name}")
+                        await params.result_callback({
+                            "status": "warning", 
+                            "message": f"SYSTEM DIRECTIVE: Tell the user: 'We already have patients named {names_str} registered with this phone number. Are you one of them updating your name, or a new family member?'"
+                        })
+                        return
+                    else:
+                        existing_patient_id = best_match_id
+                
+                elif is_same_patient == "yes":
+                    # User confirmed they are an existing patient. Link to the closest match.
+                    existing_patient_id = best_match_id if best_match_id else str(existing_patients[0]['id'])
+                
+                elif is_same_patient == "no":
+                    # User confirmed they are a new family member
+                    existing_patient_id = None
  
             # 2. Intercept 2: Check for existing upcoming appointments
             if not force_book:
