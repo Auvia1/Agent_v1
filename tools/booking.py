@@ -172,8 +172,10 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
  
             # 2. Intercept 2: Check for existing upcoming appointments
             if not force_book:
+                # ✅ FIX: Added p.name as patient_name to the SELECT query
                 upcoming_query = """
-                    SELECT a.appointment_start, d.name as doctor_name FROM appointments a
+                    SELECT a.appointment_start, d.name as doctor_name, p.name as patient_name 
+                    FROM appointments a
                     JOIN patients p ON a.patient_id = p.id JOIN doctors d ON a.doctor_id = d.id
                     WHERE p.phone = $1 AND a.status IN ('confirmed', 'pending') AND a.deleted_at IS NULL AND a.appointment_start >= NOW()
                     ORDER BY a.appointment_start ASC LIMIT 1
@@ -182,8 +184,15 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
                 if upcoming_appt:
                     appt_time = upcoming_appt['appointment_start'].astimezone(pytz.timezone('Asia/Kolkata')).strftime('%b %d at %I:%M %p')
                     doc_name = upcoming_appt['doctor_name']
-                    logger.warning(f"🛑 SMART INTERCEPT: Existing upcoming appointment on {appt_time}!")
-                    await params.result_callback({"status": "warning", "message": f"SYSTEM DIRECTIVE: Tell the user: 'I see you already have an upcoming appointment on {appt_time} with {doc_name}. Do you want to proceed with booking an additional new appointment?'"})
+                    pat_name = upcoming_appt['patient_name'] # ✅ Extracted the name!
+                    
+                    logger.warning(f"🛑 SMART INTERCEPT: Existing upcoming appointment on {appt_time} for {pat_name}!")
+                    
+                    # ✅ FIX: Updated the System Directive to include the exact phrasing you want
+                    await params.result_callback({
+                        "status": "warning", 
+                        "message": f"SYSTEM DIRECTIVE: Tell the user: 'I see you already have an appointment booked under the name {pat_name} with {doc_name} on {appt_time}. Do you want to proceed with booking a new one?'"
+                    })
                     return
  
             # 3. Intercept 3: Follow-up check
