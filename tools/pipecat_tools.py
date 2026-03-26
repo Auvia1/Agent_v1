@@ -1,3 +1,4 @@
+#tools/pipecat_tools.py
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from tools.pool import init_tool_db, get_pool  # re-export so agent.py import path stays the same
@@ -67,6 +68,10 @@ voice_book_appointment_schema = FunctionSchema(
         "is_followup": {
             "type": "string", 
             "description": "'unknown' by default. Pass 'yes' if user confirms it is a 7-day free follow-up, 'no' if new."
+        },
+        "is_same_patient": {
+            "type": "string",
+            "description": "'unknown' by default. Pass 'yes' if the user confirms they are the same person updating their name, or 'no' if they are a new family member."
         }
     },
     required=["doctor_id", "patient_name", "start_time_iso", "phone", "reason"],
