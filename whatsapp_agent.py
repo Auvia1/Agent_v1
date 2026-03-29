@@ -162,11 +162,19 @@ async def receive_whatsapp_message(request: Request):
                             slots = result_data.get("all_available_slots", [])
                             doc_id = result_data.get("doctor_id")
                             doc_name = result_data.get("doctor_name")
+                            
+                            # 👇 NEW: Grab the specialty from the tool result
+                            speciality = result_data.get("speciality", "") 
                             target_date = result_data.get("target_date")
 
                             if slots and doc_id:
                                 clean_phone = sender_phone.replace("+91", "").replace("+", "")
-                                await send_interactive_slots(clean_phone, doc_name, target_date, slots)
+                                
+                                # 👇 NEW: Combine name and specialty for the WhatsApp menu
+                                display_name = f"{doc_name} ({speciality})" if speciality else doc_name
+                                
+                                await send_interactive_slots(clean_phone, display_name, target_date, slots)
+                                
                                 if redis_client:
                                     await redis_client.setex(f"last_doc_id:{sender_phone}", 86400, doc_id)
                                 return {"status": "success", "message": "I have sent an interactive menu. Ask them to click it."}
@@ -184,7 +192,8 @@ async def receive_whatsapp_message(request: Request):
                         phone: str,
                         reason: str,
                         force_book: bool = False,
-                        is_followup: str = "unknown"
+                        is_followup: str = "unknown",
+                        is_same_patient: str = "unknown" # 👈 NEW: Added parameter!
                     ):
                         """Book the appointment. Pass 'yes' to is_followup if user confirmed 7-day free follow-up."""
                         p = WAParams()
@@ -193,7 +202,8 @@ async def receive_whatsapp_message(request: Request):
                         if not doctor_id:
                             return {"status": "error", "message": "SYSTEM DIRECTIVE: Ask the user to select a doctor/time slot first."}
 
-                        await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup)
+                        # 👈 NEW: Passing is_same_patient to the real tool
+                        await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient)
                         result_data = p.result
 
                         if result_data and result_data.get("status") == "success":

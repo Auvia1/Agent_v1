@@ -1,4 +1,5 @@
 #tools/booking.py
+#tools/booking.py
 import os
 import datetime
 import asyncio
@@ -51,6 +52,12 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         async with pool.acquire() as conn:
             clinic_id_query = "SELECT clinic_id FROM doctors WHERE id = $1::uuid"
             clinic_id = await conn.fetchval(clinic_id_query, doctor_id)
+            
+            # 🛑 ADD THIS CHECK: Don't proceed if clinic_id is None
+            if not clinic_id:
+                logger.error("🚨 Execution aborted: clinic_id is None (Doctor not found).")
+                await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: The doctor ID was invalid. Please apologize to the user and ask them to select the time slot again."})
+                return
             
             # ✅ Pass the family logic down to the query
             patient_id = await get_or_create_patient(conn, str(clinic_id), clean_name, clean_phone, is_same_patient, existing_patient_id)
@@ -132,6 +139,15 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
             
             clinic_id_query = "SELECT clinic_id FROM doctors WHERE id = $1::uuid"
             clinic_id = await conn.fetchval(clinic_id_query, doctor_id)
+            
+            # 🛑 NEW INTERCEPT 0: Guard against hallucinated/invalid doctor IDs
+            if not clinic_id:
+                logger.error(f"🚨 Invalid Doctor ID passed by LLM: {doctor_id}")
+                await params.result_callback({
+                    "status": "error",
+                    "message": "SYSTEM DIRECTIVE: Tell the user a system error occurred while finding the doctor. Ask them to please say their preferred time again to retry."
+                })
+                return # <-- CRITICAL: Stop execution here
             
             # 🔥 NEW INTERCEPT 1: Fetch ALL family members with this phone number!
             patient_check_query = "SELECT id, name FROM patients WHERE phone = $1 AND clinic_id = $2::uuid"
@@ -221,6 +237,11 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
  
     except Exception as e:
         logger.warning(f"⚠️ DB Intercept Error: {e}")
+        await params.result_callback({
+            "status": "error",
+            "message": "SYSTEM DIRECTIVE: Tell the user a system error occurred and to please call the clinic directly."
+        })
+        return # <-- This ensures we don't proceed to book on error
  
     # 4. Passed all checks → Proceed to actual booking
     await _execute_booking(params, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup_bool, is_same_patient, existing_patient_id)
