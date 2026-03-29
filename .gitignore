@@ -13,3 +13,4 @@ __pycache__/
 venv/
 # Tests cache
 .pytest_cache/google-credentials.json
+ai-receptionist-tts-485811-d0bb1bbcfd26.json
