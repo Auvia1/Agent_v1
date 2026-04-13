@@ -1,841 +1,25 @@
-#with sarvam tts language auto-detection and noise filtering for better accuracy and less hallucinations. Also added razorpay webhook handler for payment confirmation.
-#call_agent.py
-# import os
-# import json
-# import uuid
-# import re  # <-- NEW: Added for language detection
-# from datetime import datetime
-# import pytz
-# import redis.asyncio as redis
-# from dotenv import load_dotenv
-# from loguru import logger
-# from fastapi import APIRouter, Request, Form, WebSocket
-# from fastapi.responses import HTMLResponse
-
-# try:
-#     from twilio.twiml.voice_response import VoiceResponse, Connect
-# except ImportError:
-#     VoiceResponse = None
-#     Connect = None
-#     logger.warning("⚠️ Twilio not installed — phone call endpoints disabled.")
-
-# from pipecat.frames.frames import Frame, TextFrame, TranscriptionFrame, TTSSpeakFrame, TTSUpdateSettingsFrame
-# from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-# from pipecat.pipeline.pipeline import Pipeline
-# from pipecat.pipeline.runner import PipelineRunner
-# from pipecat.pipeline.task import PipelineParams, PipelineTask
-# from pipecat.processors.aggregators.llm_context import LLMContext
-# from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-# from pipecat.transports.base_transport import BaseTransport, TransportParams
-# from pipecat.transports.daily.transport import DailyParams, DailyTransport
-# from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-# from pipecat.runner.types import DailyRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
-# from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
-# from pipecat.serializers.twilio import TwilioFrameSerializer
-# from pipecat.services.sarvam.stt import SarvamSTTService
-# from pipecat.services.sarvam.tts import SarvamTTSService
-# from pipecat.services.google.llm import GoogleLLMService
-
-# from tools.pipecat_tools import register_all_tools, get_tools_schema
-# from tools.notify import handle_successful_payment
-
-# load_dotenv(override=True)
-
-# router = APIRouter()
-# redis_client = None
-
-# async def ensure_redis_client():
-#     global redis_client
-#     if redis_client:
-#         return
-#     try:
-#         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-#         redis_client = redis.from_url(redis_url, decode_responses=True)
-#         await redis_client.ping()
-#         logger.info("✅ Redis client connected successfully.")
-#     except Exception as e:
-#         logger.warning(f"⚠️ Redis connection failed: {e}")
-#         redis_client = None
-
-
-# # ==========================================================
-# # 🛠️ PROCESSORS (Cleaned up Noise Filter & Language Auto-Detect)
-# # ==========================================================
-# class STTTextCleanerProcessor(FrameProcessor):
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-#         if isinstance(frame, TranscriptionFrame):
-#             text = frame.text.strip().lower()
-            
-#             # 🔥 Ignore tiny background noises to stop hallucinations
-#             if len(text) <= 2:
-#                 return  # Drop frame entirely
-
-#             logger.info(f"🎤 USER SAID [Raw STT]: {text}")
-
-#             corrections = {
-#                 "పార్లమెంట్": "అపాయింట్మెంట్", "apartment": "appointment",
-#                 "అపార్ట్మెంట్": "అపాయింట్మెంట్", "department": "appointment",
-#                 "తెలుగు": "telugu", "हिंदी": "hindi"
-#             }
-#             for k, v in corrections.items():
-#                 text = text.replace(k, v)
-#             frame.text = text
-            
-#         await self.push_frame(frame, direction)
-
-# # 🔥 NEW: Auto-detects language from LLM text and safely configures Sarvam TTS
-# class AutoLanguageProcessor(FrameProcessor):
-#     def __init__(self):
-#         super().__init__()
-#         self.current_language = "en-IN" # Default starting language
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         # 🐛 THE FIX: This MUST be called first so Pipecat registers the call StartFrame!
-#         await super().process_frame(frame, direction)
-        
-#         if isinstance(frame, TextFrame):
-#             text = frame.text
-#             new_lang = self.current_language
-            
-#             # Detect language based on script
-#             if re.search(r'[\u0c00-\u0c7f]', text):
-#                 new_lang = "te-IN"
-#             elif re.search(r'[\u0900-\u097f]', text):
-#                 new_lang = "hi-IN"
-#             elif re.search(r'[a-zA-Z]', text):
-#                 new_lang = "en-IN"
-                
-#             # If the language changed, tell Sarvam BEFORE sending the text
-#             if new_lang != self.current_language:
-#                 logger.info(f"🌐 Auto-switching TTS language to: {new_lang}")
-#                 self.current_language = new_lang
-#                 await self.push_frame(
-#                     TTSUpdateSettingsFrame(settings={"language": new_lang, "voice": "anushka"}), 
-#                     direction
-#                 )
-                
-#         # Push the actual text/audio frame downstream!
-#         await self.push_frame(frame, direction)
-
-# class BillingTracker(FrameProcessor):
-#     def __init__(self):
-#         super().__init__()
-#         self.tts_chars = 0
-#         self.llm_output_tokens = 0
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-#         if isinstance(frame, TextFrame):
-#             self.tts_chars += len(frame.text)
-#             self.llm_output_tokens += (len(frame.text) / 4.0)
-#         await self.push_frame(frame, direction)
-
-
-# # ==========================================================
-# # 🎙️ PIPECAT RUNNER (Fully Isolated Per Call)
-# # ==========================================================
-# async def run_bot(transport: BaseTransport, call_sid: str = "local_test", is_twilio: bool = False):
-#     await ensure_redis_client()
-
-#     # ✅ 1. DYNAMIC TIME: Generate fresh time for every single call
-#     ist = pytz.timezone('Asia/Kolkata')
-#     current_time = datetime.now(ist).strftime('%A, %B %d, %Y at %I:%M %p IST')
-
-#     # ✅ 2. FIXED PROMPT: Removed the hallucinatory instruction about bracketed tags
-#     voice_system_prompt = f"""Role: Mithra Hospital AI Receptionist.
-# CURRENT LIVE TIME: {current_time}
-
-# You transition strictly through phases. NEVER backtrack.
-
-# --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
-# 1. MIRROR THE USER: Automatically identify the language the user is speaking and reply in that EXACT same language. Do NOT narrate your actions. Just answer naturally.
-# 2. PURITY OF LANGUAGE (NO MIXING): If you are speaking Telugu, use ONLY Telugu words (e.g., "తొమ్మిది" for 9). NEVER mix Hindi words (like "nau") into a Telugu sentence, and vice versa.
-# 3. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu/Hindi script (e.g. 'ఫీవర్ అండ్ కాఫ్' = 'fever and cough'). Treat it as the locked language, not a switch request.
-# 4. NO BOUNCING & CONFUSION RECOVERY: Once locked into a language, DO NOT switch back and forth. If you don't understand the user's input, ask them to repeat it IN THE LOCKED LANGUAGE (e.g., "క్షమించండి, నాకు అర్థం కాలేదు" for Telugu). NEVER revert to English to ask for clarification.
-# 5. TRANSLATE SYSTEM DIRECTIVES: If a tool returns a "SYSTEM DIRECTIVE" asking you to prompt the user (e.g., asking if they are a new family member), you MUST translate that question into the currently locked language before speaking. NEVER read it in English if the conversation is in Telugu/Hindi.
-# 6. DATABASE TRANSLATION (STRICT): No matter what language the user is speaking, ALL data you send to your tools (patient_name, reason, problem_or_speciality) MUST be translated to plain ENGLISH before calling the tool.
-# 7. TIME FORMATTING: 
-#    - In English: Use standard formats (e.g., 9:00 AM).
-#    - In Hindi/Telugu: Translate all digits/times into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00" in regional languages.
-
-# --- INTENT ROUTING ---
-# 1. CANCEL/RESCHEDULE: Say: "Based on hospital policy, appointments cannot be cancelled or rescheduled through the AI assistant. Please call the clinic directly." (End flow).
-# 2. FOLLOW-UP BOOKING: If the user asks for a "follow-up", ask EXACTLY: "Could you please tell me your 10-digit phone number so I can check your records?" Once provided, SILENTLY call `verify_followup`.
-
-# --- CORE BOOKING STATES ---
-
-# PHASE 0 (Symptoms Gathering - MANDATORY ONLY IF MISSING):
-# Check if the user has ALREADY provided symptoms (e.g., "I have a fever", "జలుబుగా ఉంది").
-# - If SYMPTOMS ALREADY GIVEN: SKIP THIS PHASE completely and go directly to PHASE 1.
-# - If NO symptoms given: ask "What medical problem or symptoms are you experiencing?" 
-# CRITICAL: DO NOT call `check_availability` until symptoms are explicitly stated. Do NOT assume 'General Physician' based on background noise.
-
-# PHASE 1 (Availability):
-# ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZERO text.
-
-# PHASE 2 (Offer & Negotiation):
-# - Initial Offer: Read the `system_directive` exactly as intended. (ONLY translate if the user is currently speaking Hindi/Telugu, and spell out times).
-# - Negotiation: Look at the `all_available_slots` to find alternative times if asked. DO NOT repeat the initial offer if they just ask a question.
-
-# PHASE 3 (Details Request):
-# If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?" 
-# (Note: If they already provided their phone number for a follow-up, just ask for their name).
-# If the user asks a completely unrelated question or chit-chats, answer them naturally, but gently guide them back to providing their name and phone number to secure the booking.
-
-# PHASE 4 (The Silent Trigger):
-# If the user provides a name and a 10-digit number, YOU MUST STOP SPEAKING.
-# Immediately call `voice_book_appointment` (Ensure you translate the name and reason to English first!).
-# CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name.
-
-# PHASE 5 (Confirmation):
-# ONLY AFTER the tool returns "success", say exactly the confirmation message based on the tool result:
-# - Paid Appointment: "A tentative appointment is booked and a payment link is sent to your WhatsApp. Please do the payment in 15 minutes to confirm the booking. Thank you."
-# - Free Follow-up: "Your free follow-up appointment is confirmed. A WhatsApp message has been sent to you. Thank you."
-# (CRITICAL: ONLY translate this if the user is speaking Hindi/Telugu).
-# CRITICAL RULE: DO NOT append any questions like "Shall I book this?" at the end. Just say the confirmation and STOP.
-# Immediately after saying this, call the `end_call` tool.
-# """
-
-#     in_rate = 8000 if is_twilio else 16000
-#     out_rate = 8000 if is_twilio else 24000
-
-#     stt = SarvamSTTService(
-#         api_key=os.getenv("SARVAM_API_KEY"),
-#         language="unknown",
-#         model="saaras:v3",
-#         mode="transcribe"
-#     )
-#     tts = SarvamTTSService(
-#         api_key=os.getenv("SARVAM_API_KEY"),
-#         target_language_code="en-IN",
-#         model="bulbul:v2",
-#         speaker="anushka",
-#         speech_sample_rate=out_rate
-#     )
-#     llm = GoogleLLMService(
-#         api_key=os.getenv("GEMINI_API_KEY"),
-#         model="gemini-2.5-flash"
-#     )
-
-#     register_all_tools(llm)
-
-#     context = LLMContext(
-#         messages=[{"role": "system", "content": voice_system_prompt}],
-#         tools=get_tools_schema()
-#     )
-#     context_aggregator = LLMContextAggregatorPair(context)
-#     billing_tracker = BillingTracker()
-
-#     pipeline = Pipeline([
-#         transport.input(),
-#         stt,
-#         STTTextCleanerProcessor(),
-#         context_aggregator.user(),
-#         llm,
-#         billing_tracker,
-#         AutoLanguageProcessor(), # 👈 NEW: Auto-language detection!
-#         tts,
-#         transport.output(),
-#         context_aggregator.assistant()
-#     ])
-
-#     task = PipelineTask(
-#         pipeline,
-#         params=PipelineParams(
-#             audio_in_sample_rate=in_rate,
-#             audio_out_sample_rate=out_rate,
-#             enable_metrics=True,
-#             enable_usage_metrics=True
-#         )
-#     )
-
-#     @transport.event_handler("on_client_connected")
-#     async def on_client_connected(transport, client):
-#         if redis_client:
-#             await redis_client.setex(f"active_call:{call_sid}", 3600, "in_progress")
-#         await task.queue_frames([
-#             TTSSpeakFrame(
-#                 "Hello! Welcome to Mithra Hospitals. How can I help you today?",
-#                 append_to_context=True
-#             )
-#         ])
-
-#     @transport.event_handler("on_client_disconnected")
-#     async def on_client_disconnected(transport, client):
-#         if redis_client:
-#             await redis_client.delete(f"active_call:{call_sid}")
-#             await redis_client.setex(
-#                 f"history:{call_sid}",
-#                 86400,
-#                 json.dumps([m for m in context.messages if m.get("role") != "system"])
-#             )
-#         await task.cancel()
-
-#     runner = PipelineRunner(handle_sigint=False)
-#     await runner.run(task)
-
-# # ==========================================================
-# # 🔌 PIPECAT WEB RUNNER ENTRY POINT
-# # ==========================================================
-# async def bot(runner_args: RunnerArguments):
-#     transport = None
-#     if isinstance(runner_args, SmallWebRTCRunnerArguments):
-#         transport = SmallWebRTCTransport(
-#             webrtc_connection=runner_args.webrtc_connection,
-#             params=TransportParams(
-#                 audio_in_enabled=True,
-#                 audio_out_enabled=True,
-#                 audio_out_sample_rate=24000
-#             )
-#         )
-#     elif isinstance(runner_args, DailyRunnerArguments):
-#         transport = DailyTransport(
-#             runner_args.room_url,
-#             runner_args.token,
-#             "Pipecat Bot",
-#             params=DailyParams(
-#                 audio_in_enabled=True,
-#                 audio_out_enabled=True,
-#                 audio_out_sample_rate=24000
-#             )
-#         )
-#     if transport:
-#         await run_bot(transport, call_sid=f"local_webrtc_{uuid.uuid4().hex[:8]}", is_twilio=False)
-
-# # ==========================================================
-# # 💳 RAZORPAY WEBHOOK
-# # ==========================================================
-# @router.post("/razorpay-webhook")
-# async def razorpay_webhook(request: Request):
-#     try:
-#         payload = await request.json()
-#         if payload.get("event") == "payment_link.paid":
-#             entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-#             appointment_id = entity.get("notes", {}).get("appointment_id")
-#             if appointment_id:
-#                 logger.info(f"💰 Payment received for appointment: {appointment_id}")
-#                 await handle_successful_payment(appointment_id)
-#         return {"status": "ok"}
-#     except Exception as e:
-#         logger.error(f"❌ Razorpay Webhook Error: {e}")
-#         return {"status": "error"}
-
-# # ==========================================================
-# # 📞 TWILIO ROUTES
-# # ==========================================================
-# @router.post("/incoming")
-# async def incoming_call(request: Request, CallSid: str = Form(None)):
-#     logger.info(f"📞 NEW CALL INITIATED! ID: {CallSid}")
-#     if not VoiceResponse or not Connect:
-#         return HTMLResponse(content="Twilio not installed", status_code=500)
-#     response = VoiceResponse()
-#     connect = Connect()
-#     wss_url = str(request.base_url).replace("http", "ws") + "media"
-#     if CallSid:
-#         connect.stream(url=wss_url).parameter(name="CallSid", value=CallSid)
-#     response.append(connect)
-#     return HTMLResponse(content=str(response), media_type="application/xml")
-
-# @router.post("/voice")
-# async def voice_callback(request: Request):
-#     base_url = str(request.base_url).replace("http://", "wss://").replace("https://", "wss://")
-#     twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-#     <Response>
-#         <Connect>
-#             <Stream url="{base_url}media" />
-#         </Connect>
-#         <Hangup />
-#     </Response>"""
-#     return HTMLResponse(content=twiml_response, media_type="application/xml")
-
-# @router.websocket("/media")
-# async def websocket_endpoint(websocket: WebSocket):
-#     await websocket.accept()
-#     logger.info("🔌 Twilio connected to /media WebSocket!")
-#     try:
-#         message = await websocket.receive_text()
-#         data = json.loads(message)
-#         if data.get('event') == 'connected':
-#             message = await websocket.receive_text()
-#             data = json.loads(message)
-#         if data.get('event') == 'start':
-#             stream_sid = data['start']['streamSid']
-#             call_sid = data['start']['callSid']
-#             logger.info(f"🎙️ Twilio Stream Started: {stream_sid}")
-#             serializer = TwilioFrameSerializer(
-#                 stream_sid=stream_sid,
-#                 params=TwilioFrameSerializer.InputParams(auto_hang_up=False)
-#             )
-#             transport = FastAPIWebsocketTransport(
-#                 websocket=websocket,
-#                 params=FastAPIWebsocketParams(
-#                     audio_in_enabled=True,
-#                     audio_out_enabled=True,
-#                     add_wav_header=False,
-#                     serializer=serializer
-#                 )
-#             )
-#             await run_bot(transport, call_sid=call_sid, is_twilio=True)
-#     except Exception as e:
-#         logger.error(f"❌ WebSocket error: {e}")
-
-
-
-# #call_agent.py
-# import os
-# import json
-# import uuid
-# import re 
-# import time  # <-- Billing duration
-# from datetime import datetime
-# import pytz
-# import redis.asyncio as redis
-# from dotenv import load_dotenv
-# from loguru import logger
-# from fastapi import APIRouter, Request, Form, WebSocket
-# from fastapi.responses import HTMLResponse
-
-# try:
-#     from twilio.twiml.voice_response import VoiceResponse, Connect
-# except ImportError:
-#     VoiceResponse = None
-#     Connect = None
-#     logger.warning("⚠️ Twilio not installed — phone call endpoints disabled.")
-
-# from pipecat.frames.frames import Frame, TextFrame, TranscriptionFrame, TTSSpeakFrame, TTSUpdateSettingsFrame, FunctionCallInProgressFrame
-# from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-# from pipecat.pipeline.pipeline import Pipeline
-# from pipecat.pipeline.runner import PipelineRunner
-# from pipecat.pipeline.task import PipelineParams, PipelineTask
-# from pipecat.processors.aggregators.llm_context import LLMContext
-# from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-# from pipecat.transports.base_transport import BaseTransport, TransportParams
-# from pipecat.transports.daily.transport import DailyParams, DailyTransport
-# from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-# from pipecat.runner.types import DailyRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
-# from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
-# from pipecat.serializers.twilio import TwilioFrameSerializer
-
-# from pipecat.services.sarvam.stt import SarvamSTTService
-# from pipecat.services.google.tts import GoogleTTSService
-# from pipecat.services.google.llm import GoogleLLMService
-
-# from tools.pipecat_tools import register_all_tools, get_tools_schema
-# from tools.notify import handle_successful_payment
-
-# load_dotenv(override=True)
-
-# router = APIRouter()
-# redis_client = None
-
-# async def ensure_redis_client():
-#     global redis_client
-#     if redis_client:
-#         return
-#     try:
-#         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-#         redis_client = redis.from_url(redis_url, decode_responses=True)
-#         await redis_client.ping()
-#         logger.info("✅ Redis client connected successfully.")
-#     except Exception as e:
-#         logger.warning(f"⚠️ Redis connection failed: {e}")
-#         redis_client = None
-
-# # ==========================================================
-# # 🧠 SYSTEM PROMPT (Untouched, exactly as previous working version)
-# # ==========================================================
-# ist = pytz.timezone('Asia/Kolkata')
-# current_time = datetime.now(ist).strftime('%A, %B %d, %Y at %I:%M %p IST')
-
-# VOICE_SYSTEM_PROMPT = f"""Role: Mithra Hospital AI Receptionist.
-# CURRENT LIVE TIME: {current_time}
-
-# You transition strictly through phases. NEVER backtrack.
-
-# --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
-# 1. MIRROR THE USER: Automatically identify the language the user is speaking and reply in that EXACT same language. Do NOT narrate your actions. Just answer naturally.
-# 2. PURITY OF LANGUAGE (NO MIXING): If you are speaking Telugu, use ONLY Telugu words (e.g., "తొమ్మిది" for 9). NEVER mix Hindi words (like "nau") into a Telugu sentence, and vice versa.
-# 3. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu/Hindi script (e.g. 'ఫీవర్ అండ్ కాఫ్' = 'fever and cough'). Treat it as the locked language, not a switch request.
-# 4. NO BOUNCING & CONFUSION RECOVERY: Once locked into a language, DO NOT switch back and forth. If you don't understand the user's input, ask them to repeat it IN THE LOCKED LANGUAGE (e.g., "క్షమించండి, నాకు అర్థం కాలేదు" for Telugu). NEVER revert to English to ask for clarification.
-# 5. TRANSLATE SYSTEM DIRECTIVES: If a tool returns a "SYSTEM DIRECTIVE" asking you to prompt the user (e.g., asking if they are a new family member), you MUST translate that question into the currently locked language before speaking. NEVER read it in English if the conversation is in Telugu/Hindi.
-# 6. DATABASE TRANSLATION (STRICT): No matter what language the user is speaking, ALL data you send to your tools (patient_name, reason, problem_or_speciality) MUST be translated to plain ENGLISH before calling the tool.
-# 7. TIME FORMATTING: 
-#    - In English: Use standard formats (e.g., 9:00 AM).
-#    - In Hindi/Telugu: Translate all digits/times into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00" in regional languages.
-# 8. RESPECTFUL VOCABULARY: NEVER use the Telugu word "రోగి" (rogi) to refer to a patient. It sounds clinical and disrespectful. Always use the English word "patient" (e.g., "దయచేసి పేషెంట్ పేరు చెప్పగలరా?").
-# 9. PACE & SPEED: Keep all your sentences extremely short, crisp, and punchy. Avoid long explanations.
-
-# --- INTENT ROUTING ---
-# 1. CANCEL/RESCHEDULE: Say: "Based on hospital policy, appointments cannot be cancelled or rescheduled through the AI assistant. Please call the clinic directly." (End flow).
-# 2. FOLLOW-UP BOOKING: If the user asks for a "follow-up", ask EXACTLY: "Could you please tell me your 10-digit phone number so I can check your records?" Once provided, SILENTLY call `verify_followup`.
-
-# --- CORE BOOKING STATES ---
-
-# PHASE 0 (Symptoms Gathering - MANDATORY ONLY IF MISSING):
-# Check if the user has ALREADY provided symptoms (e.g., "I have a fever", "జలుబుగా ఉంది").
-# - If SYMPTOMS ALREADY GIVEN: SKIP THIS PHASE completely and go directly to PHASE 1.
-# - If NO symptoms given: ask "What medical problem or symptoms are you experiencing?" 
-# CRITICAL: DO NOT call `check_availability` until symptoms are explicitly stated. Do NOT assume 'General Physician' based on background noise.
-
-# PHASE 1 (Availability):
-# ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZERO text.
-
-# PHASE 2 (Offer & Negotiation):
-# - Initial Offer: Read the `system_directive` exactly as intended. (ONLY translate if the user is currently speaking Hindi/Telugu, and spell out times).
-# - Negotiation: Look at the `all_available_slots` to find alternative times if asked. DO NOT repeat the initial offer if they just ask a question.
-
-# PHASE 3 (Details Request):
-# If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?" 
-# (Note: If they already provided their phone number for a follow-up, just ask for their name).
-# If the user asks a completely unrelated question or chit-chats, answer them naturally, but gently guide them back to providing their name and phone number to secure the booking.
-
-# PHASE 4 (The Silent Trigger):
-# If the user provides a name and a 10-digit number, YOU MUST STOP SPEAKING.
-# Immediately call `voice_book_appointment` (Ensure you translate the name and reason to English first!).
-# CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name.
-
-# PHASE 5 (Confirmation):
-# ONLY AFTER the tool returns "success", inform the patient.
-# CRITICAL RULES FOR CONFIRMATION:
-# - Speak ONLY in the locked language. NEVER speak English first and then translate. 
-# - For a paid appointment, say EXACTLY the native translation of this phrase: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes. Thank you."
-# - For a free follow-up, say EXACTLY the native translation of: "Your free follow-up appointment is confirmed. A WhatsApp message has been sent to you. Thank you."
-# - DO NOT append any questions like "Shall I book this?"
-# - Immediately after saying this, call the `end_call` tool.
-# """
-
-# # ==========================================================
-# # 🛠️ PROCESSORS (Shortened Filler Words for Speed)
-# # ==========================================================
-# class STTTextCleanerProcessor(FrameProcessor):
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-#         if isinstance(frame, TranscriptionFrame):
-#             text = frame.text.strip().lower()
-            
-#             if len(text) <= 2:
-#                 return
-
-#             logger.info(f"🎤 USER SAID [Raw STT]: {text}")
-
-#             corrections = {
-#                 "పార్లమెంట్": "అపాయింట్మెంట్", "apartment": "appointment",
-#                 "అపార్ట్మెంట్": "అపాయింట్మెంట్", "department": "appointment",
-#                 "తెలుగు": "telugu", "हिंदी": "hindi"
-#             }
-#             for k, v in corrections.items():
-#                 text = text.replace(k, v)
-#             frame.text = text
-            
-#         await self.push_frame(frame, direction)
-
-# class AutoLanguageProcessor(FrameProcessor):
-#     def __init__(self):
-#         super().__init__()
-#         self.current_language = "en-US"
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-        
-#         if isinstance(frame, TextFrame):
-#             text = frame.text
-#             new_lang = self.current_language
-#             new_voice = "en-US-Chirp3-HD-Despina"
-            
-#             if re.search(r'[\u0c00-\u0c7f]', text):
-#                 new_lang = "te-IN"
-#                 new_voice = "te-IN-Chirp3-HD-Despina"
-#             elif re.search(r'[\u0900-\u097f]', text):
-#                 new_lang = "hi-IN"
-#                 new_voice = "hi-IN-Chirp3-HD-Despina"
-#             elif re.search(r'[a-zA-Z]', text):
-#                 new_lang = "en-US"
-#                 new_voice = "en-US-Chirp3-HD-Despina"
-                
-#             if new_lang != self.current_language:
-#                 logger.info(f"🌐 Auto-switching TTS language to: {new_lang} | Voice: {new_voice}")
-#                 self.current_language = new_lang
-#                 await self.push_frame(
-#                     TTSUpdateSettingsFrame(settings={"language": new_lang, "voice": new_voice, "speaking_rate": 1.15}), 
-#                     direction
-#                 )
-                
-#         # 👇 SHORTENED: Very quick filler words so they don't block the queue
-#         if isinstance(frame, FunctionCallInProgressFrame):
-#             filler = ""
-#             if frame.function_name == "voice_book_appointment":
-#                 if self.current_language == "te-IN": filler = "ఒక్క నిమిషం..."
-#                 elif self.current_language == "hi-IN": filler = "एक मिनट..."
-#                 else: filler = "One moment..."
-#             elif frame.function_name == "check_availability":
-#                 if self.current_language == "te-IN": filler = "చూస్తున్నాను..."
-#                 elif self.current_language == "hi-IN": filler = "चेक कर रही हूँ..."
-#                 else: filler = "Checking..."
-            
-#             if filler:
-#                 logger.info(f"⏳ Playing short filler audio: {filler}")
-#                 await self.push_frame(TTSSpeakFrame(text=filler), direction)
-                
-#         await self.push_frame(frame, direction)
-
-# class BillingTracker(FrameProcessor):
-#     def __init__(self, context):
-#         super().__init__()
-#         self.tts_chars = 0
-#         self.llm_output_tokens_est = 0
-#         self.start_time = time.time()
-#         self.context = context 
-
-#     async def process_frame(self, frame: Frame, direction: FrameDirection):
-#         await super().process_frame(frame, direction)
-        
-#         if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
-#             self.tts_chars += len(frame.text)
-#             self.llm_output_tokens_est += len(frame.text) / 4.0 
-
-#         await self.push_frame(frame, direction)
-        
-#     def generate_receipt(self):
-#         duration_seconds = time.time() - self.start_time
-#         duration_minutes = duration_seconds / 60.0
-        
-#         history_str = json.dumps(self.context.messages)
-#         total_input_tokens = len(history_str) / 4.0
-        
-#         stt_cost_usd = duration_minutes * 0.006
-#         tts_cost_usd = self.tts_chars * 0.00003
-#         llm_input_cost_usd = total_input_tokens * 0.0000003
-#         llm_output_cost_usd = self.llm_output_tokens_est * 0.0000025
-        
-#         total_cost_usd = stt_cost_usd + tts_cost_usd + llm_input_cost_usd + llm_output_cost_usd
-#         cost_per_minute_usd = total_cost_usd / duration_minutes if duration_minutes > 0 else 0
-        
-#         exchange_rate = 83.5
-#         total_cost_inr = total_cost_usd * exchange_rate
-#         cost_per_minute_inr = cost_per_minute_usd * exchange_rate
-        
-#         logger.info("\n" + "="*55)
-#         logger.info("💰 SESSION BILLING RECEIPT (INR) 💰")
-#         logger.info("="*55)
-#         logger.info(f"⏱️ Duration:        {duration_minutes:.2f} mins ({duration_seconds:.0f}s)")
-#         logger.info(f"🎙️ STT Cost:        ₹{stt_cost_usd * exchange_rate:.4f} (${stt_cost_usd:.4f})")
-#         logger.info(f"🧠 LLM In Cost:     ₹{llm_input_cost_usd * exchange_rate:.4f} (${llm_input_cost_usd:.4f}) | ~{total_input_tokens:.0f} tokens")
-#         logger.info(f"🧠 LLM Out Cost:    ₹{llm_output_cost_usd * exchange_rate:.4f} (${llm_output_cost_usd:.4f}) | ~{self.llm_output_tokens_est:.0f} tokens")
-#         logger.info(f"🗣️ TTS Cost:        ₹{tts_cost_usd * exchange_rate:.4f} (${tts_cost_usd:.4f}) | {self.tts_chars} chars")
-#         logger.info("-" * 55)
-#         logger.info(f"💵 TOTAL COST:      ₹{total_cost_inr:.4f} (${total_cost_usd:.4f})")
-#         logger.info(f"📊 COST PER MIN:    ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd:.4f})")
-#         logger.info("="*55 + "\n")
-
-# # ==========================================================
-# # 🎙️ PIPECAT RUNNER
-# # ==========================================================
-# async def run_bot(transport: BaseTransport, call_sid: str = "local_test", is_twilio: bool = False):
-#     await ensure_redis_client()
-
-#     in_rate = 8000 if is_twilio else 16000
-#     out_rate = 8000 if is_twilio else 24000
-
-#     stt = SarvamSTTService(
-#         api_key=os.getenv("SARVAM_API_KEY"),
-#         language="unknown",
-#         model="saaras:v3",
-#         mode="transcribe"
-#     )
-    
-#     google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-#     if not google_creds_path or not os.path.exists(google_creds_path):
-#         logger.error(f"🚨 Missing Google Credentials File! Path checked: {google_creds_path}")
-
-#     tts = GoogleTTSService(
-#         credentials_path=google_creds_path,
-#         voice="en-US-Chirp3-HD-Despina",
-#         language="en-US"
-#     )
-    
-#     llm = GoogleLLMService(
-#         api_key=os.getenv("GEMINI_API_KEY"),
-#         model="gemini-2.5-flash"
-#     )
-
-#     register_all_tools(llm)
-
-#     context = LLMContext(
-#         messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}],
-#         tools=get_tools_schema()
-#     )
-#     context_aggregator = LLMContextAggregatorPair(context)
-#     billing_tracker = BillingTracker(context)
-
-#     pipeline = Pipeline([
-#         transport.input(),
-#         stt,
-#         STTTextCleanerProcessor(),
-#         context_aggregator.user(),
-#         llm,
-#         billing_tracker,
-#         AutoLanguageProcessor(), 
-#         tts,
-#         transport.output(),
-#         context_aggregator.assistant()
-#     ])
-
-#     task = PipelineTask(
-#         pipeline,
-#         params=PipelineParams(
-#             audio_in_sample_rate=in_rate,
-#             audio_out_sample_rate=out_rate,
-#             enable_metrics=True,
-#             enable_usage_metrics=True
-#         )
-#     )
-
-#     @transport.event_handler("on_client_connected")
-#     async def on_client_connected(transport, client):
-#         if redis_client:
-#             await redis_client.setex(f"active_call:{call_sid}", 3600, "in_progress")
-#         await task.queue_frames([
-#             TTSSpeakFrame(
-#                 "Hello! Welcome to Mithra Hospitals. How can I help you today?",
-#                 append_to_context=True
-#             )
-#         ])
-
-#     @transport.event_handler("on_client_disconnected")
-#     async def on_client_disconnected(transport, client):
-#         if redis_client:
-#             await redis_client.delete(f"active_call:{call_sid}")
-#             await redis_client.setex(
-#                 f"history:{call_sid}",
-#                 86400,
-#                 json.dumps([m for m in context.messages if m.get("role") != "system"])
-#             )
-#         await task.cancel()
-
-#     runner = PipelineRunner(handle_sigint=False)
-#     await runner.run(task)
-    
-#     billing_tracker.generate_receipt()
-
-# # ==========================================================
-# # 🔌 PIPECAT WEB RUNNER ENTRY POINT
-# # ==========================================================
-# async def bot(runner_args: RunnerArguments):
-#     transport = None
-#     if isinstance(runner_args, SmallWebRTCRunnerArguments):
-#         transport = SmallWebRTCTransport(
-#             webrtc_connection=runner_args.webrtc_connection,
-#             params=TransportParams(
-#                 audio_in_enabled=True,
-#                 audio_out_enabled=True,
-#                 audio_out_sample_rate=24000
-#             )
-#         )
-#     elif isinstance(runner_args, DailyRunnerArguments):
-#         transport = DailyTransport(
-#             runner_args.room_url,
-#             runner_args.token,
-#             "Pipecat Bot",
-#             params=DailyParams(
-#                 audio_in_enabled=True,
-#                 audio_out_enabled=True,
-#                 audio_out_sample_rate=24000
-#             )
-#         )
-#     if transport:
-#         await run_bot(transport, call_sid=f"local_webrtc_{uuid.uuid4().hex[:8]}", is_twilio=False)
-
-# # ==========================================================
-# # 💳 RAZORPAY WEBHOOK
-# # ==========================================================
-# @router.post("/razorpay-webhook")
-# async def razorpay_webhook(request: Request):
-#     try:
-#         payload = await request.json()
-#         if payload.get("event") == "payment_link.paid":
-#             entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
-#             appointment_id = entity.get("notes", {}).get("appointment_id")
-#             if appointment_id:
-#                 logger.info(f"💰 Payment received for appointment: {appointment_id}")
-#                 await handle_successful_payment(appointment_id)
-#         return {"status": "ok"}
-#     except Exception as e:
-#         logger.error(f"❌ Razorpay Webhook Error: {e}")
-#         return {"status": "error"}
-
-# # ==========================================================
-# # 📞 TWILIO ROUTES
-# # ==========================================================
-# @router.post("/incoming")
-# async def incoming_call(request: Request, CallSid: str = Form(None)):
-#     logger.info(f"📞 NEW CALL INITIATED! ID: {CallSid}")
-#     if not VoiceResponse or not Connect:
-#         return HTMLResponse(content="Twilio not installed", status_code=500)
-#     response = VoiceResponse()
-#     connect = Connect()
-#     wss_url = str(request.base_url).replace("http", "ws") + "media"
-#     if CallSid:
-#         connect.stream(url=wss_url).parameter(name="CallSid", value=CallSid)
-#     response.append(connect)
-#     return HTMLResponse(content=str(response), media_type="application/xml")
-
-# @router.post("/voice")
-# async def voice_callback(request: Request):
-#     base_url = str(request.base_url).replace("http://", "wss://").replace("https://", "wss://")
-#     twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-#     <Response>
-#         <Connect>
-#             <Stream url="{base_url}media" />
-#         </Connect>
-#         <Hangup />
-#     </Response>"""
-#     return HTMLResponse(content=twiml_response, media_type="application/xml")
-
-# @router.websocket("/media")
-# async def websocket_endpoint(websocket: WebSocket):
-#     await websocket.accept()
-#     logger.info("🔌 Twilio connected to /media WebSocket!")
-#     try:
-#         message = await websocket.receive_text()
-#         data = json.loads(message)
-#         if data.get('event') == 'connected':
-#             message = await websocket.receive_text()
-#             data = json.loads(message)
-#         if data.get('event') == 'start':
-#             stream_sid = data['start']['streamSid']
-#             call_sid = data['start']['callSid']
-#             logger.info(f"🎙️ Twilio Stream Started: {stream_sid}")
-#             serializer = TwilioFrameSerializer(
-#                 stream_sid=stream_sid,
-#                 params=TwilioFrameSerializer.InputParams(auto_hang_up=False)
-#             )
-#             transport = FastAPIWebsocketTransport(
-#                 websocket=websocket,
-#                 params=FastAPIWebsocketParams(
-#                     audio_in_enabled=True,
-#                     audio_out_enabled=True,
-#                     add_wav_header=False,
-#                     serializer=serializer
-#                 )
-#             )
-#             await run_bot(transport, call_sid=call_sid, is_twilio=True)
-#     except Exception as e:
-#         logger.error(f"❌ WebSocket error: {e}")
-
-#call_agent.py
+# call_agent.py
 import os
 import json
-import uuid
 import re 
-import time  # <-- Billing duration
+import time 
 from datetime import datetime
 import pytz
 import redis.asyncio as redis
 from dotenv import load_dotenv
 from loguru import logger
-from fastapi import APIRouter, Request, Form, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request, Form, WebSocket, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+import base64
+import aiohttp
+import asyncio
+import google.generativeai as genai
+
+from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.frames.frames import Frame, AudioRawFrame, CancelFrame
+
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 
 try:
     from twilio.twiml.voice_response import VoiceResponse, Connect
@@ -844,17 +28,17 @@ except ImportError:
     Connect = None
     logger.warning("⚠️ Twilio not installed — phone call endpoints disabled.")
 
-from pipecat.frames.frames import Frame, TextFrame, TranscriptionFrame, TTSSpeakFrame, TTSUpdateSettingsFrame, FunctionCallInProgressFrame
+from pipecat.frames.frames import (
+    TextFrame, TranscriptionFrame,
+    TTSSpeakFrame, TTSUpdateSettingsFrame, FunctionCallInProgressFrame
+)
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.daily.transport import DailyParams, DailyTransport
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.runner.types import DailyRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
+from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 from pipecat.serializers.twilio import TwilioFrameSerializer
 
@@ -864,8 +48,13 @@ from pipecat.services.google.llm import GoogleLLMService
 
 from tools.pipecat_tools import register_all_tools, get_tools_schema
 from tools.notify import handle_successful_payment
+from tools.pool import get_pool
 
 load_dotenv(override=True)
+
+# 👇 FIXED: Global LLM Initialization for the Summarizer
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+summarizer_model = genai.GenerativeModel("gemini-1.5-flash")
 
 router = APIRouter()
 redis_client = None
@@ -884,7 +73,7 @@ async def ensure_redis_client():
         redis_client = None
 
 # ==========================================================
-# 🧠 SYSTEM PROMPT (Original prompt + Negotiation & Lang Lock fixes)
+# 🧠 SYSTEM PROMPT
 # ==========================================================
 ist = pytz.timezone('Asia/Kolkata')
 current_time = datetime.now(ist).strftime('%A, %B %d, %Y at %I:%M %p IST')
@@ -895,60 +84,60 @@ CURRENT LIVE TIME: {current_time}
 You transition strictly through phases. NEVER backtrack.
 
 --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
-1. MIRROR THE USER: Automatically identify the language the user is speaking and reply in that EXACT same language. Do NOT narrate your actions. Just answer naturally.
-2. PURITY OF LANGUAGE (NO MIXING): If you are speaking Telugu, use ONLY Telugu words (e.g., "తొమ్మిది" for 9). NEVER mix Hindi words (like "nau") into a Telugu sentence, and vice versa.
-3. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu/Hindi script (e.g. 'ఫీవర్ అండ్ కాఫ్' = 'fever and cough'). Treat it as the locked language, not a switch request.
-4. NO BOUNCING & CONFUSION RECOVERY: Once locked into a language, DO NOT switch back and forth. If you don't understand the user's input, ask them to repeat it IN THE LOCKED LANGUAGE (e.g., "క్షమించండి, నాకు అర్థం కాలేదు" for Telugu). NEVER revert to English to ask for clarification.
-5. TRANSLATE SYSTEM DIRECTIVES: If a tool returns a "SYSTEM DIRECTIVE" asking you to prompt the user (e.g., asking if they are a new family member), you MUST translate that question into the currently locked language before speaking. NEVER read it in English if the conversation is in Telugu/Hindi.
-6. DATABASE TRANSLATION (STRICT): No matter what language the user is speaking, ALL data you send to your tools (patient_name, reason, problem_or_speciality) MUST be translated to plain ENGLISH before calling the tool.
-7. TIME FORMATTING: 
-   - In English: Use standard formats (e.g., 9:00 AM).
-   - In Hindi/Telugu: Translate all digits/times into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00" in regional languages.
-8. RESPECTFUL VOCABULARY: NEVER use the Telugu word "రోగి" (rogi) to refer to a patient. It sounds clinical and disrespectful. Always use the English word "patient" (e.g., "దయచేసి పేషెంట్ పేరు చెప్పగలరా?").
+1. STRICT LANGUAGE LOCK: Your default and locked language is Telugu. Even if the user speaks English words or Hindi words (e.g., "book cheyandi", "10 o clock", "haan"), YOU MUST IGNORE IT AND REPLY IN TELUGU ONLY.
+2. EXPLICIT INTENT TO SWITCH: NEVER change languages unless the user explicitly commands you to change the language.
+3. PURITY OF LANGUAGE: Do not write English words in your Telugu responses.
+4. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu script. Treat it as the locked language.
+5. DATABASE TRANSLATION (CRITICAL): ALL data sent to your internal tools (like patient_name, reason) MUST be translated to plain ENGLISH.
+6. TIME FORMATTING: Translate all digits into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00".
+7. PHONE NUMBER SPELLING (CRITICAL): When repeating a phone number to confirm, spell out EACH digit individually phonetically. E.g., for 830, say "ఎనిమిది మూడు సున్నా...". NEVER say "ఎనభై మూడు" (eighty-three).
+8. RESPECTFUL VOCABULARY: NEVER use the Telugu word "రోగి" (rogi). Always use the English word "patient".
 9. PACE & SPEED: Keep all your sentences extremely short, crisp, and punchy. Avoid long explanations.
-10. STAY IN NATIVE LANGUAGE: Do NOT switch languages just because of name pronunciations. ONLY switch if the user explicitly asks to speak in Hindi or English.
+
+--- 🛠️ FAQ & DOCUMENT LOOKUP ---
+If at ANY point the user asks a general question about clinic policies, surgeries, cancellations, or doctors:
+1. Immediately call `query_clinic_faq`.
+2. Answer ONLY using the retrieved info.
+3. After answering, re-enter the flow. Ask: "Would you like to book an appointment today?" or resume where you left off.
 
 --- INTENT ROUTING ---
-1. CANCEL/RESCHEDULE: Say: "Based on hospital policy, appointments cannot be cancelled or rescheduled through the AI assistant. Please call the clinic directly." (End flow).
+1. CANCEL/RESCHEDULE: Use `query_clinic_faq` to explain the policy. Then ask if there is anything else they need.
 2. FOLLOW-UP BOOKING: If the user asks for a "follow-up", ask EXACTLY: "Could you please tell me your 10-digit phone number so I can check your records?" Once provided, SILENTLY call `verify_followup`.
 
 --- CORE BOOKING STATES ---
 
-PHASE 0 (Symptoms Gathering - MANDATORY ONLY IF MISSING):
-Check if the user has ALREADY provided symptoms (e.g., "I have a fever", "జలుబుగా ఉంది").
-- If SYMPTOMS ALREADY GIVEN: SKIP THIS PHASE completely and go directly to PHASE 1.
-- If NO symptoms given: ask "What medical problem or symptoms are you experiencing?" 
-CRITICAL: DO NOT call `check_availability` until symptoms are explicitly stated. Do NOT assume 'General Physician' based on background noise.
+PHASE 0 (Symptoms Gathering):
+Check if the user has ALREADY provided symptoms. If NO symptoms given: ask "What medical problem or symptoms are you experiencing?"
+CRITICAL: DO NOT call `check_availability` until symptoms are explicitly stated.
 
 PHASE 1 (Availability):
 ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZERO text.
 
 PHASE 2 (Offer & Negotiation):
-- Initial Offer: Read the `system_directive` exactly as intended. (ONLY translate if the user is currently speaking Hindi/Telugu, and spell out times).
-- Negotiation: Look at the `all_available_slots` to find alternative times if asked. Check if the requested time is available, confirm it, and ONLY THEN proceed to Phase 3. DO NOT repeat the initial offer if they just ask a question.
+- Initial Offer: Read the `system_directive` exactly as intended. Look at `all_available_slots` to find alternative times if asked.
 
 PHASE 3 (Details Request):
-If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?" 
-(Note: If they already provided their phone number for a follow-up, just ask for their name).
-If the user asks a completely unrelated question or chit-chats, answer them naturally, but gently guide them back to providing their name and phone number to secure the booking.
+If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?"
+
+PHASE 3.5 (Confirmation - CRITICAL):
+Once the user provides their name and phone number, DO NOT call the booking tool immediately.
+You MUST repeat the phone number back to them digit-by-digit to confirm. 
+Say: "Your number is [Digit Digit Digit...]. Is that correct?"
 
 PHASE 4 (The Silent Trigger):
-If the user provides a name and a 10-digit number, YOU MUST STOP SPEAKING.
-Immediately call `voice_book_appointment` (Ensure you translate the name and reason to English first!).
-CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name.
+ONLY AFTER the user explicitly says "Yes", "Correct", "Avunu", etc., YOU MUST STOP SPEAKING.
+Immediately call `voice_book_appointment`. 
+CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name again.
 
-PHASE 5 (Confirmation):
+PHASE 5 (Confirmation & Persistence):
 ONLY AFTER the tool returns "success", inform the patient.
-CRITICAL RULES FOR CONFIRMATION:
-- Speak ONLY in the locked language. NEVER speak English first and then translate. 
-- For a paid appointment, say EXACTLY the native translation of this phrase: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes. Thank you."
-- For a free follow-up, say EXACTLY the native translation of: "Your free follow-up appointment is confirmed. A WhatsApp message has been sent to you. Thank you."
-- DO NOT append any questions like "Shall I book this?"
-- Immediately after saying this, call the `end_call` tool.
+- For a paid appointment, say EXACTLY the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
+- CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
+- ONLY call `end_call` if the user explicitly says they are done or says goodbye.
 """
 
 # ==========================================================
-# 🛠️ PROCESSORS
+# 🛠️ PROCESSORS & SERIALIZERS
 # ==========================================================
 class STTTextCleanerProcessor(FrameProcessor):
     def __init__(self, session_id):
@@ -959,72 +148,83 @@ class STTTextCleanerProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.strip().lower()
-            
             if len(text) <= 2:
                 return
-
             logger.info(f"[{self.session_id}] 🎤 USER SAID [Raw STT]: {text}")
-
             corrections = {
-                "పార్లమెంట్": "అపాయింట్మెంట్", "apartment": "appointment",
-                "అపార్ట్మెంట్": "అపాయింట్మెంట్", "department": "appointment",
-                "తెలుగు": "telugu", "हिंदी": "hindi"
+                "పార్లమెంట్": "అపాయింట్మెంట్",
+                "apartment": "appointment",
+                "అపార్ట్మెంట్": "అపాయింట్మెంట్",
+                "department": "appointment",
+                "తెలుగు": "telugu",
+                "हिंदी": "hindi"
             }
             for k, v in corrections.items():
                 text = text.replace(k, v)
             frame.text = text
-            
         await self.push_frame(frame, direction)
 
 class AutoLanguageProcessor(FrameProcessor):
     def __init__(self, session_id):
         super().__init__()
         self.session_id = session_id
-        self.current_language = "te-IN" # Default to Telugu
+        self.current_language = "te-IN"
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
         if isinstance(frame, TextFrame):
             text = frame.text
             new_lang = self.current_language
-            new_voice = f"{self.current_language}-Chirp3-HD-Despina" # Always default to current language + female voice
-            
-            # 👇 FIXED: Strict language locking. Only switch if confident it's a new primary language.
-            if re.search(r'[\u0c00-\u0c7f]', text): # Telugu
+            new_voice = f"{self.current_language}-Chirp3-HD-Despina"
+
+            has_telugu = bool(re.search(r'[\u0c00-\u0c7f]', text))
+            has_hindi = bool(re.search(r'[\u0900-\u097f]', text))
+
+            if has_telugu:
                 new_lang = "te-IN"
                 new_voice = "te-IN-Chirp3-HD-Despina"
-            elif re.search(r'[\u0900-\u097f]', text): # Hindi
+            elif has_hindi:
                 new_lang = "hi-IN"
                 new_voice = "hi-IN-Chirp3-HD-Despina"
-            elif re.search(r'^[a-zA-Z0-9\s\.,!\?\'\"]+$', text) and len(text) > 10: 
-                # Only switch to English if it's completely Latin text, to avoid STT hallucination switching
+            elif re.search(r'[a-zA-Z]', text) and not (has_telugu or has_hindi) and len(text) > 10:
                 new_lang = "en-US"
                 new_voice = "en-US-Chirp3-HD-Despina"
-                
+
             if new_lang != self.current_language:
-                logger.info(f"[{self.session_id}] 🌐 Auto-switching TTS language to: {new_lang} | Voice: {new_voice}")
+                logger.info(f"[{self.session_id}] 🌐 Auto-switching TTS to: {new_lang} | Voice: {new_voice}")
                 self.current_language = new_lang
                 await self.push_frame(
-                    TTSUpdateSettingsFrame(settings={"language": new_lang, "voice": new_voice, "speaking_rate": 1.15}), 
+                    TTSUpdateSettingsFrame(settings={
+                        "language": new_lang,
+                        "voice": new_voice,
+                        "speaking_rate": 1.15
+                    }),
                     direction
                 )
-                
+
         if isinstance(frame, FunctionCallInProgressFrame):
             filler = ""
             if frame.function_name == "voice_book_appointment":
-                if self.current_language == "te-IN": filler = "ఒక్క నిమిషం..."
-                elif self.current_language == "hi-IN": filler = "एक मिनट..."
-                else: filler = "One moment..."
+                filler = (
+                    "ఒక్క నిమిషం" if self.current_language == "te-IN"
+                    else "एक मिनट" if self.current_language == "hi-IN"
+                    else "One moment"
+                )
             elif frame.function_name == "check_availability":
-                if self.current_language == "te-IN": filler = "చూస్తున్నాను..."
-                elif self.current_language == "hi-IN": filler = "चेक कर रही हूँ..."
-                else: filler = "Checking..."
-            
+                filler = (
+                    "చూస్తున్నాను" if self.current_language == "te-IN"
+                    else "चेक कर रही हूँ" if self.current_language == "hi-IN"
+                    else "Checking"
+                )
+            elif frame.function_name == "query_clinic_faq":
+                filler = (
+                    "చూస్తున్నాను" if self.current_language == "te-IN"
+                    else "Checking"
+                )
             if filler:
-                logger.info(f"[{self.session_id}] ⏳ Playing short filler audio: {filler}")
+                logger.info(f"[{self.session_id}] ⏳ Filler: {filler}")
                 await self.push_frame(TTSSpeakFrame(text=filler), direction)
-                
+
         await self.push_frame(frame, direction)
 
 class BillingTracker(FrameProcessor):
@@ -1033,89 +233,183 @@ class BillingTracker(FrameProcessor):
         self.tts_chars = 0
         self.llm_output_tokens_est = 0
         self.start_time = time.time()
-        self.context = context 
+        self.context = context
         self.session_id = session_id
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
         if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
             self.tts_chars += len(frame.text)
-            self.llm_output_tokens_est += len(frame.text) / 4.0 
-
+            self.llm_output_tokens_est += len(frame.text) / 4.0
         await self.push_frame(frame, direction)
-        
+
     def generate_receipt(self):
         duration_seconds = time.time() - self.start_time
         duration_minutes = duration_seconds / 60.0
-        
         history_str = json.dumps(self.context.messages)
         total_input_tokens = len(history_str) / 4.0
-        
         stt_cost_usd = duration_minutes * 0.006
         tts_cost_usd = self.tts_chars * 0.00003
         llm_input_cost_usd = total_input_tokens * 0.0000003
         llm_output_cost_usd = self.llm_output_tokens_est * 0.0000025
-        
         total_cost_usd = stt_cost_usd + tts_cost_usd + llm_input_cost_usd + llm_output_cost_usd
-        cost_per_minute_usd = total_cost_usd / duration_minutes if duration_minutes > 0 else 0
-        
         exchange_rate = 83.5
         total_cost_inr = total_cost_usd * exchange_rate
-        cost_per_minute_inr = cost_per_minute_usd * exchange_rate
-        
-        logger.info("\n" + "="*55)
-        logger.info(f"[{self.session_id}] 💰 SESSION BILLING RECEIPT (INR) 💰")
-        logger.info("="*55)
-        logger.info(f"⏱️ Duration:        {duration_minutes:.2f} mins ({duration_seconds:.0f}s)")
-        logger.info(f"🎙️ STT Cost:        ₹{stt_cost_usd * exchange_rate:.4f} (${stt_cost_usd:.4f})")
-        logger.info(f"🧠 LLM In Cost:     ₹{llm_input_cost_usd * exchange_rate:.4f} (${llm_input_cost_usd:.4f}) | ~{total_input_tokens:.0f} tokens")
-        logger.info(f"🧠 LLM Out Cost:    ₹{llm_output_cost_usd * exchange_rate:.4f} (${llm_output_cost_usd:.4f}) | ~{self.llm_output_tokens_est:.0f} tokens")
-        logger.info(f"🗣️ TTS Cost:        ₹{tts_cost_usd * exchange_rate:.4f} (${tts_cost_usd:.4f}) | {self.tts_chars} chars")
+        cost_per_minute_inr = (total_cost_usd / duration_minutes if duration_minutes > 0 else 0) * exchange_rate
+
+        logger.info("\n" + "=" * 55)
+        logger.info(f"[{self.session_id}] 💰 SESSION BILLING RECEIPT 💰")
+        logger.info("=" * 55)
+        logger.info(f"⏱️  Duration:     {duration_minutes:.2f} mins ({duration_seconds:.0f}s)")
+        logger.info(f"🎙️  STT Cost:     ₹{stt_cost_usd * exchange_rate:.4f} (${stt_cost_usd:.4f})")
+        logger.info(f"🧠 LLM In:       ₹{llm_input_cost_usd * exchange_rate:.4f} (~{total_input_tokens:.0f} tokens)")
+        logger.info(f"🧠 LLM Out:      ₹{llm_output_cost_usd * exchange_rate:.4f} (~{self.llm_output_tokens_est:.0f} tokens)")
+        logger.info(f"🗣️  TTS Cost:     ₹{tts_cost_usd * exchange_rate:.4f} ({self.tts_chars} chars)")
         logger.info("-" * 55)
-        logger.info(f"💵 TOTAL COST:      ₹{total_cost_inr:.4f} (${total_cost_usd:.4f})")
-        logger.info(f"📊 COST PER MIN:    ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd:.4f})")
-        logger.info("="*55 + "\n")
+        logger.info(f"💵 TOTAL:        ₹{total_cost_inr:.4f} (${total_cost_usd:.4f})")
+        logger.info(f"📊 PER MIN:      ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd * exchange_rate:.4f})")
+        logger.info("=" * 55 + "\n")
+
+class PipecatBugFixProcessor(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, AudioRawFrame):
+            if not hasattr(frame, 'pts'): frame.pts = None
+            if not hasattr(frame, 'transport_destination'): frame.transport_destination = None
+            if not hasattr(frame, 'id'): frame.id = "fixed-audio-frame-id"
+            if not hasattr(frame, 'broadcast_sibling_id'): frame.broadcast_sibling_id = None
+        await self.push_frame(frame, direction)
+
+class VobizFrameSerializer(FrameSerializer):
+    def __init__(self, stream_sid: str = None):
+        self.stream_sid = stream_sid
+
+    async def serialize(self, frame: Frame) -> str | None:
+        if isinstance(frame, AudioRawFrame):
+            payload = base64.b64encode(frame.audio).decode("utf-8")
+            vobiz_msg = {
+                "event": "playAudio",
+                "media": {
+                    "payload": payload,
+                    "contentType": "audio/x-l16",
+                    "sampleRate": frame.sample_rate
+                }
+            }
+            return json.dumps(vobiz_msg)
+        elif isinstance(frame, CancelFrame):
+            return json.dumps({"event": "clearAudio"}) 
+        return None
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        try:
+            if isinstance(data, bytes): data = data.decode("utf-8")
+            msg = json.loads(data)
+            if msg.get("event") == "media":
+                payload = msg.get("media", {}).get("payload")
+                if payload:
+                    audio_data = base64.b64decode(payload)
+                    frame = AudioRawFrame(audio=audio_data, sample_rate=8000, num_channels=1)
+                    if not hasattr(frame, 'id'): frame.id = "inbound-audio-id"
+                    if not hasattr(frame, 'pts'): frame.pts = None
+                    if not hasattr(frame, 'transport_destination'): frame.transport_destination = None
+                    if not hasattr(frame, 'broadcast_sibling_id'): frame.broadcast_sibling_id = None
+                    return frame
+            elif msg.get("event") == "stop":
+                return CancelFrame()
+        except Exception as e:
+            logger.error(f"Error deserializing Vobiz frame: {e}")
+        return None
+
+# ==========================================================
+# 🔌 VOBIZ REST API HANGUP HELPER
+# ==========================================================
+async def force_vobiz_hangup(call_uuid: str):
+    if not call_uuid or call_uuid == "vobiz_call": return
+    auth_id = os.getenv("VOBIZ_AUTH_ID")
+    auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
+    if not auth_id or not auth_token: return
+    url = f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/{call_uuid}/"
+    headers = {"X-Auth-ID": auth_id, "X-Auth-Token": auth_token}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=headers) as resp:
+                if resp.status in [200, 202, 204]: logger.info(f"☎️ Call Terminated via API: {call_uuid}")
+    except Exception as e:
+        logger.error(f"❌ Failed to forcefully hang up Vobiz call: {e}")
+
+# ==========================================================
+# 💾 DB SAVING HELPER
+# ==========================================================
+async def save_call_log(call_sid: str, caller_number: str, duration: float, messages: list):
+    logger.info(f"💾 Starting DB save for call {call_sid}...")
+    try:
+        # 1. Improved Transcript Extraction
+        lines = []
+        for m in messages:
+            role = "AI" if m.get('role') == 'model' else "Patient"
+            content = ""
+            if 'content' in m and isinstance(m['content'], str):
+                content = m['content']
+            elif 'parts' in m:
+                for p in m['parts']:
+                    if isinstance(p, dict) and 'text' in p:
+                        content += p['text']
+                    elif isinstance(p, str):
+                        content += p
+            if content.strip():
+                lines.append(f"{role}: {content.strip()}")
+        
+        transcript = "\n".join(lines)
+        
+        # 2. Summarize using Global Summarizer
+        if not lines:
+            ai_summary = "Call connected but no speech detected."
+        else:
+            prompt = f"""
+            Analyze the following medical receptionist transcript and provide a summary strictly following this template:
+            "Patient {{Name}} booked an appointment on {{Date}} at {{Time}} with {{Doctor Name}} ({{Specialization}}) due to {{Reason}}"
+
+            Rules:
+            - If no appointment was booked, write: "Patient called to inquire but no appointment was booked."
+            - Translate any Telugu details into English for the summary.
+            - Keep it to one single sentence.
+
+            Transcript:
+            {transcript}
+            """
+            # 👇 FIXED: Using global 'summarizer_model' instead of re-initializing
+            response = await asyncio.to_thread(summarizer_model.generate_content, prompt)
+            ai_summary = response.text.strip() if response else "No summary generated."
+
+        # 3. Insert into DB
+        pool = get_pool()
+        if not pool: return
+        async with pool.acquire() as conn:
+            clinic_id = await conn.fetchval("SELECT id FROM clinics LIMIT 1")
+            if not clinic_id: return
+            await conn.execute("""
+                INSERT INTO calls (clinic_id, type, caller, agent_type, duration, ai_summary)
+                VALUES ($1, 'incoming', $2, 'ai', $3, $4)
+            """, clinic_id, caller_number, int(duration), ai_summary)
+        logger.info(f"✅ Call Log Saved | Summary: {ai_summary}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save call log: {e}", exc_info=True)
 
 # ==========================================================
 # 🎙️ PIPECAT RUNNER
 # ==========================================================
-async def run_bot(transport: BaseTransport, call_sid: str = "local_test", is_twilio: bool = False):
+async def run_bot(transport: BaseTransport, call_sid: str = "local_test", caller_number: str = "Unknown"):
     await ensure_redis_client()
     session_id = call_sid[:8]
-
-    in_rate = 8000 if is_twilio else 16000
-    out_rate = 8000 if is_twilio else 24000
-
-    stt = SarvamSTTService(
-        api_key=os.getenv("SARVAM_API_KEY"),
-        language="unknown",
-        model="saaras:v3",
-        mode="transcribe"
-    )
-    
     google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if not google_creds_path or not os.path.exists(google_creds_path):
-        logger.error(f"🚨 Missing Google Credentials File! Path checked: {google_creds_path}")
 
-    # 👇 FIXED: Starts with Female Telugu voice immediately
-    tts = GoogleTTSService(
-        credentials_path=google_creds_path,
-        voice="te-IN-Chirp3-HD-Despina", 
-        language="te-IN"
-    )
-    
-    llm = GoogleLLMService(
-        api_key=os.getenv("GEMINI_API_KEY"),
-        model="gemini-2.5-flash"
-    )
+    stt = SarvamSTTService(api_key=os.getenv("SARVAM_API_KEY"), language="unknown", model="saaras:v3", mode="transcribe")
+    tts = GoogleTTSService(credentials_path=google_creds_path, voice="te-IN-Chirp3-HD-Despina", language="te-IN")
+    llm = GoogleLLMService(api_key=os.getenv("GEMINI_API_KEY"), model="gemini-2.5-flash")
 
     register_all_tools(llm)
 
-    context = LLMContext(
-        messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}],
-        tools=get_tools_schema()
-    )
+    context = LLMContext(messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}], tools=get_tools_schema())
     context_aggregator = LLMContextAggregatorPair(context)
     billing_tracker = BillingTracker(context, session_id)
 
@@ -1126,77 +420,104 @@ async def run_bot(transport: BaseTransport, call_sid: str = "local_test", is_twi
         context_aggregator.user(),
         llm,
         billing_tracker,
-        AutoLanguageProcessor(session_id), 
+        AutoLanguageProcessor(session_id),
         tts,
+        PipecatBugFixProcessor(),
         transport.output(),
         context_aggregator.assistant()
     ])
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=in_rate,
-            audio_out_sample_rate=out_rate,
-            enable_metrics=True,
-            enable_usage_metrics=True
-        )
-    )
+    task = PipelineTask(pipeline, params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000, enable_metrics=True, enable_usage_metrics=True))
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        if redis_client:
-            await redis_client.setex(f"active_call:{call_sid}", 3600, "in_progress")
-        await task.queue_frames([
-            # 👇 FIXED: Initial greeting is now natively in Telugu
-            TTSSpeakFrame(
-                "నమస్కారం! మిత్ర హాస్పిటల్స్‌కు స్వాగతం. నేను మీకు ఎలా సహాయపడగలను?",
-                append_to_context=True
-            )
-        ])
+        await task.queue_frames([TTSSpeakFrame("నమస్కారం! మిత్ర హాస్పిటల్స్‌కు స్వాగతం. నేను మీకు ఎలా సహాయపడగలను?", append_to_context=True)])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        if redis_client:
-            await redis_client.delete(f"active_call:{call_sid}")
-            await redis_client.setex(
-                f"history:{call_sid}",
-                86400,
-                json.dumps([m for m in context.messages if m.get("role") != "system"])
-            )
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
-    
     billing_tracker.generate_receipt()
 
+    duration = time.time() - billing_tracker.start_time
+    # 👇 Keep awaiting to ensure record is written before shutdown
+    await save_call_log(call_sid, caller_number, duration, context.messages)
+
 # ==========================================================
-# 🔌 PIPECAT WEB RUNNER ENTRY POINT
+# 📞 TWILIO ROUTES
 # ==========================================================
-async def bot(runner_args: RunnerArguments):
-    transport = None
-    if isinstance(runner_args, SmallWebRTCRunnerArguments):
-        transport = SmallWebRTCTransport(
-            webrtc_connection=runner_args.webrtc_connection,
-            params=TransportParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_out_sample_rate=24000
-            )
-        )
-    elif isinstance(runner_args, DailyRunnerArguments):
-        transport = DailyTransport(
-            runner_args.room_url,
-            runner_args.token,
-            "Pipecat Bot",
-            params=DailyParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_out_sample_rate=24000
-            )
-        )
-    if transport:
-        await run_bot(transport, call_sid=f"local_webrtc_{uuid.uuid4().hex[:8]}", is_twilio=False)
+@router.post("/incoming")
+async def incoming_call(request: Request, From: str = Form("Unknown")):
+    base_url = str(request.base_url).replace("http://", "wss://").replace("https://", "wss://").rstrip("/")
+    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect><Stream url="{base_url}/media"><Parameter name="caller" value="{From}" /></Stream></Connect>
+</Response>"""
+    return Response(content=xml_response, media_type="text/xml")
+
+@router.post("/voice")
+async def voice_callback(request: Request):
+    return await incoming_call(request)
+
+@router.websocket("/media")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        raw = await websocket.receive_text()
+        data = json.loads(raw)
+        if data.get("event") == "connected":
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+
+        if data.get("event") == "start":
+            stream_sid = data["start"]["streamSid"]
+            call_sid   = data["start"].get("callSid", "twilio_call")
+            caller_number = data["start"].get("customParameters", {}).get("caller", "Unknown")
+            serializer = TwilioFrameSerializer(stream_sid=stream_sid, params=TwilioFrameSerializer.InputParams(auto_hang_up=False))
+            transport = FastAPIWebsocketTransport(websocket=websocket, params=FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True, add_wav_header=False, serializer=serializer))
+            await run_bot(transport, call_sid=call_sid, caller_number=caller_number)
+    except Exception as e:
+        logger.error(f"❌ Twilio WebSocket error: {e}")
+
+# ==========================================================
+# 📞 VOBIZ ROUTES
+# ==========================================================
+@router.post("/vobiz-events")
+async def vobiz_events(request: Request):
+    body_bytes = await request.body()
+    body_str = body_bytes.decode('utf-8')
+    if "event=hangup" in body_str.lower(): return Response(content="<Response></Response>", media_type="text/xml")
+    wss_url = "wss://gymnastic-oversentimentally-marcelino.ngrok-free.dev/vobiz-media"
+    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Speak>Connecting to AI.</Speak>
+    <Stream bidirectional="true" keepCallAlive="true">{wss_url}</Stream>
+</Response>"""
+    return Response(content=xml_response, media_type="text/xml")
+
+@router.websocket("/vobiz-media")
+async def vobiz_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    call_sid = "vobiz_call"
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            if data.get("event") == "start":
+                stream_sid = data["start"].get("streamId", "vobiz_stream")
+                call_sid = data["start"].get("callId", "vobiz_call")
+                caller_number = data["start"].get("metadata", {}).get("from", "Unknown")
+                break
+        serializer = VobizFrameSerializer(stream_sid=stream_sid)
+        transport = FastAPIWebsocketTransport(websocket=websocket, params=FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True, add_wav_header=False, serializer=serializer))
+        await run_bot(transport, call_sid=call_sid, caller_number=caller_number)
+    except Exception as e:
+        logger.error(f"❌ Vobiz WebSocket error: {e}")
+    finally:
+        await websocket.close()
+        await force_vobiz_hangup(call_sid)
 
 # ==========================================================
 # 💳 RAZORPAY WEBHOOK
@@ -1205,72 +526,736 @@ async def bot(runner_args: RunnerArguments):
 async def razorpay_webhook(request: Request):
     try:
         payload = await request.json()
-        if payload.get("event") == "payment_link.paid":
+        event = payload.get("event")
+        if event in ["payment_link.paid", "payment_link.cancelled", "payment_link.expired"]:
             entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
             appointment_id = entity.get("notes", {}).get("appointment_id")
             if appointment_id:
-                logger.info(f"💰 Payment received for appointment: {appointment_id}")
-                await handle_successful_payment(appointment_id)
+                from tools.pool import get_pool
+                pool = get_pool()
+                status = "paid" if event == "payment_link.paid" else "failed"
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE payments SET status = $1 WHERE appointment_id = $2", status, appointment_id)
+                if event == "payment_link.paid": await handle_successful_payment(appointment_id)
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"❌ Razorpay Webhook Error: {e}")
         return {"status": "error"}
 
-# ==========================================================
-# 📞 TWILIO ROUTES
-# ==========================================================
-@router.post("/incoming")
-async def incoming_call(request: Request, CallSid: str = Form(None)):
-    logger.info(f"📞 NEW CALL INITIATED! ID: {CallSid}")
-    if not VoiceResponse or not Connect:
-        return HTMLResponse(content="Twilio not installed", status_code=500)
-    response = VoiceResponse()
-    connect = Connect()
-    wss_url = str(request.base_url).replace("http", "ws") + "media"
-    if CallSid:
-        connect.stream(url=wss_url).parameter(name="CallSid", value=CallSid)
-    response.append(connect)
-    return HTMLResponse(content=str(response), media_type="application/xml")
+# # call_agent.py
+# # call_agent.py
+# import os
+# import json
+# import re 
+# import time 
+# from datetime import datetime
+# import pytz
+# import redis.asyncio as redis
+# from dotenv import load_dotenv
+# from loguru import logger
+# from fastapi import APIRouter, Request, Form, WebSocket, Response
+# from fastapi.responses import HTMLResponse, JSONResponse
+# import base64
+# import aiohttp
+# import asyncio  # 👇 NEW: For background DB saving
+# import google.generativeai as genai  # 👇 NEW: For AI Summarization
 
-@router.post("/voice")
-async def voice_callback(request: Request):
-    base_url = str(request.base_url).replace("http://", "wss://").replace("https://", "wss://")
-    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Connect>
-            <Stream url="{base_url}media" />
-        </Connect>
-        <Hangup />
-    </Response>"""
-    return HTMLResponse(content=twiml_response, media_type="application/xml")
+# from pipecat.serializers.base_serializer import FrameSerializer
+# from pipecat.frames.frames import Frame, AudioRawFrame, CancelFrame
 
-@router.websocket("/media")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("🔌 Twilio connected to /media WebSocket!")
-    try:
-        message = await websocket.receive_text()
-        data = json.loads(message)
-        if data.get('event') == 'connected':
-            message = await websocket.receive_text()
-            data = json.loads(message)
-        if data.get('event') == 'start':
-            stream_sid = data['start']['streamSid']
-            call_sid = data['start']['callSid']
-            logger.info(f"🎙️ Twilio Stream Started: {stream_sid}")
-            serializer = TwilioFrameSerializer(
-                stream_sid=stream_sid,
-                params=TwilioFrameSerializer.InputParams(auto_hang_up=False)
-            )
-            transport = FastAPIWebsocketTransport(
-                websocket=websocket,
-                params=FastAPIWebsocketParams(
-                    audio_in_enabled=True,
-                    audio_out_enabled=True,
-                    add_wav_header=False,
-                    serializer=serializer
-                )
-            )
-            await run_bot(transport, call_sid=call_sid, is_twilio=True)
-    except Exception as e:
-        logger.error(f"❌ WebSocket error: {e}")
+# from pipecat.audio.vad.silero import SileroVADAnalyzer
+# from pipecat.audio.vad.vad_analyzer import VADParams
+
+# try:
+#     from twilio.twiml.voice_response import VoiceResponse, Connect
+# except ImportError:
+#     VoiceResponse = None
+#     Connect = None
+#     logger.warning("⚠️ Twilio not installed — phone call endpoints disabled.")
+
+# from pipecat.frames.frames import (
+#     TextFrame, TranscriptionFrame,
+#     TTSSpeakFrame, TTSUpdateSettingsFrame, FunctionCallInProgressFrame
+# )
+# from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+# from pipecat.pipeline.pipeline import Pipeline
+# from pipecat.pipeline.runner import PipelineRunner
+# from pipecat.pipeline.task import PipelineParams, PipelineTask
+# from pipecat.processors.aggregators.llm_context import LLMContext
+# from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+# from pipecat.transports.base_transport import BaseTransport
+# from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
+# from pipecat.serializers.twilio import TwilioFrameSerializer
+
+# from pipecat.services.sarvam.stt import SarvamSTTService
+# from pipecat.services.google.tts import GoogleTTSService
+# from pipecat.services.google.llm import GoogleLLMService
+
+# from tools.pipecat_tools import register_all_tools, get_tools_schema
+# from tools.notify import handle_successful_payment
+# from tools.pool import get_pool  # 👇 NEW: Import DB Pool
+
+# load_dotenv(override=True)
+
+# router = APIRouter()
+# redis_client = None
+
+# async def ensure_redis_client():
+#     global redis_client
+#     if redis_client:
+#         return
+#     try:
+#         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+#         redis_client = redis.from_url(redis_url, decode_responses=True)
+#         await redis_client.ping()
+#         logger.info("✅ Redis client connected successfully.")
+#     except Exception as e:
+#         logger.warning(f"⚠️ Redis connection failed: {e}")
+#         redis_client = None
+
+
+# # ==========================================================
+# # 🧠 SYSTEM PROMPT
+# # ==========================================================
+# ist = pytz.timezone('Asia/Kolkata')
+# current_time = datetime.now(ist).strftime('%A, %B %d, %Y at %I:%M %p IST')
+
+# VOICE_SYSTEM_PROMPT = f"""Role: Mithra Hospital AI Receptionist.
+# CURRENT LIVE TIME: {current_time}
+
+# You transition strictly through phases. NEVER backtrack.
+
+# --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
+# 1. STRICT LANGUAGE LOCK: Your default and locked language is Telugu. Even if the user speaks English words or Hindi words (e.g., "book cheyandi", "10 o clock", "haan"), YOU MUST IGNORE IT AND REPLY IN TELUGU ONLY.
+# 2. EXPLICIT INTENT TO SWITCH: NEVER change languages unless the user explicitly commands you to change the language.
+# 3. PURITY OF LANGUAGE: Do not write English words in your Telugu responses.
+# 4. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu script. Treat it as the locked language.
+# 5. DATABASE TRANSLATION (CRITICAL): ALL data sent to your internal tools (like patient_name, reason) MUST be translated to plain ENGLISH.
+# 6. TIME FORMATTING: Translate all digits into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00".
+# 7. PHONE NUMBER SPELLING (CRITICAL): When repeating a phone number to confirm, spell out EACH digit individually phonetically. E.g., for 830, say "ఎనిమిది మూడు సున్నా...". NEVER say "ఎనభై మూడు" (eighty-three).
+# 8. RESPECTFUL VOCABULARY: NEVER use the Telugu word "రోగి" (rogi). Always use the English word "patient".
+# 9. PACE & SPEED: Keep all your sentences extremely short, crisp, and punchy. Avoid long explanations.
+
+# --- 🛠️ FAQ & DOCUMENT LOOKUP ---
+# If at ANY point the user asks a general question about clinic policies, surgeries, cancellations, or doctors:
+# 1. Immediately call `query_clinic_faq`.
+# 2. Answer ONLY using the retrieved info.
+# 3. After answering, re-enter the flow. Ask: "Would you like to book an appointment today?" or resume where you left off.
+
+# --- INTENT ROUTING ---
+# 1. CANCEL/RESCHEDULE: Use `query_clinic_faq` to explain the policy. Then ask if there is anything else they need.
+# 2. FOLLOW-UP BOOKING: If the user asks for a "follow-up", ask EXACTLY: "Could you please tell me your 10-digit phone number so I can check your records?" Once provided, SILENTLY call `verify_followup`.
+
+# --- CORE BOOKING STATES ---
+
+# PHASE 0 (Symptoms Gathering):
+# Check if the user has ALREADY provided symptoms. If NO symptoms given: ask "What medical problem or symptoms are you experiencing?"
+# CRITICAL: DO NOT call `check_availability` until symptoms are explicitly stated.
+
+# PHASE 1 (Availability):
+# ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZERO text.
+
+# PHASE 2 (Offer & Negotiation):
+# - Initial Offer: Read the `system_directive` exactly as intended. Look at `all_available_slots` to find alternative times if asked.
+
+# PHASE 3 (Details Request):
+# If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?"
+
+# PHASE 3.5 (Confirmation - CRITICAL):
+# Once the user provides their name and phone number, DO NOT call the booking tool immediately.
+# You MUST repeat the phone number back to them digit-by-digit to confirm. 
+# Say: "Your number is [Digit Digit Digit...]. Is that correct?"
+
+# PHASE 4 (The Silent Trigger):
+# ONLY AFTER the user explicitly says "Yes", "Correct", "Avunu", etc., YOU MUST STOP SPEAKING.
+# Immediately call `voice_book_appointment`. 
+# CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name again.
+
+# PHASE 5 (Confirmation & Persistence):
+# ONLY AFTER the tool returns "success", inform the patient.
+# - For a paid appointment, say EXACTLY the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
+# - CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
+# - ONLY call `end_call` if the user explicitly says they are done or says goodbye.
+# """
+
+
+# # ==========================================================
+# # 🛠️ PROCESSORS & SERIALIZERS
+# # ==========================================================
+# class STTTextCleanerProcessor(FrameProcessor):
+#     def __init__(self, session_id):
+#         super().__init__()
+#         self.session_id = session_id
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, TranscriptionFrame):
+#             text = frame.text.strip().lower()
+#             if len(text) <= 2:
+#                 return
+#             logger.info(f"[{self.session_id}] 🎤 USER SAID [Raw STT]: {text}")
+#             corrections = {
+#                 "పార్లమెంట్": "అపాయింట్మెంట్",
+#                 "apartment": "appointment",
+#                 "అపార్ట్మెంట్": "అపాయింట్మెంట్",
+#                 "department": "appointment",
+#                 "తెలుగు": "telugu",
+#                 "हिंदी": "hindi"
+#             }
+#             for k, v in corrections.items():
+#                 text = text.replace(k, v)
+#             frame.text = text
+#         await self.push_frame(frame, direction)
+
+
+# class AutoLanguageProcessor(FrameProcessor):
+#     def __init__(self, session_id):
+#         super().__init__()
+#         self.session_id = session_id
+#         self.current_language = "te-IN"
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, TextFrame):
+#             text = frame.text
+#             new_lang = self.current_language
+#             new_voice = f"{self.current_language}-Chirp3-HD-Despina"
+
+#             has_telugu = bool(re.search(r'[\u0c00-\u0c7f]', text))
+#             has_hindi = bool(re.search(r'[\u0900-\u097f]', text))
+
+#             if has_telugu:
+#                 new_lang = "te-IN"
+#                 new_voice = "te-IN-Chirp3-HD-Despina"
+#             elif has_hindi:
+#                 new_lang = "hi-IN"
+#                 new_voice = "hi-IN-Chirp3-HD-Despina"
+#             elif re.search(r'[a-zA-Z]', text) and not (has_telugu or has_hindi) and len(text) > 10:
+#                 new_lang = "en-US"
+#                 new_voice = "en-US-Chirp3-HD-Despina"
+
+#             if new_lang != self.current_language:
+#                 logger.info(f"[{self.session_id}] 🌐 Auto-switching TTS to: {new_lang} | Voice: {new_voice}")
+#                 self.current_language = new_lang
+#                 await self.push_frame(
+#                     TTSUpdateSettingsFrame(settings={
+#                         "language": new_lang,
+#                         "voice": new_voice,
+#                         "speaking_rate": 1.15
+#                     }),
+#                     direction
+#                 )
+
+#         if isinstance(frame, FunctionCallInProgressFrame):
+#             filler = ""
+#             if frame.function_name == "voice_book_appointment":
+#                 filler = (
+#                     "ఒక్క నిమిషం" if self.current_language == "te-IN"
+#                     else "एक मिनट" if self.current_language == "hi-IN"
+#                     else "One moment"
+#                 )
+#             elif frame.function_name == "check_availability":
+#                 filler = (
+#                     "చూస్తున్నాను" if self.current_language == "te-IN"
+#                     else "चेक कर रही हूँ" if self.current_language == "hi-IN"
+#                     else "Checking"
+#                 )
+#             elif frame.function_name == "query_clinic_faq":
+#                 filler = (
+#                     "చూస్తున్నాను" if self.current_language == "te-IN"
+#                     else "Checking"
+#                 )
+#             if filler:
+#                 logger.info(f"[{self.session_id}] ⏳ Filler: {filler}")
+#                 await self.push_frame(TTSSpeakFrame(text=filler), direction)
+
+#         await self.push_frame(frame, direction)
+
+
+# class BillingTracker(FrameProcessor):
+#     def __init__(self, context, session_id):
+#         super().__init__()
+#         self.tts_chars = 0
+#         self.llm_output_tokens_est = 0
+#         self.start_time = time.time()
+#         self.context = context
+#         self.session_id = session_id
+
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+#             self.tts_chars += len(frame.text)
+#             self.llm_output_tokens_est += len(frame.text) / 4.0
+#         await self.push_frame(frame, direction)
+
+#     def generate_receipt(self):
+#         duration_seconds = time.time() - self.start_time
+#         duration_minutes = duration_seconds / 60.0
+
+#         history_str = json.dumps(self.context.messages)
+#         total_input_tokens = len(history_str) / 4.0
+
+#         stt_cost_usd = duration_minutes * 0.006
+#         tts_cost_usd = self.tts_chars * 0.00003
+#         llm_input_cost_usd = total_input_tokens * 0.0000003
+#         llm_output_cost_usd = self.llm_output_tokens_est * 0.0000025
+#         total_cost_usd = stt_cost_usd + tts_cost_usd + llm_input_cost_usd + llm_output_cost_usd
+#         cost_per_minute_usd = total_cost_usd / duration_minutes if duration_minutes > 0 else 0
+#         exchange_rate = 83.5
+#         total_cost_inr = total_cost_usd * exchange_rate
+#         cost_per_minute_inr = cost_per_minute_usd * exchange_rate
+
+#         logger.info("\n" + "=" * 55)
+#         logger.info(f"[{self.session_id}] 💰 SESSION BILLING RECEIPT 💰")
+#         logger.info("=" * 55)
+#         logger.info(f"⏱️  Duration:     {duration_minutes:.2f} mins ({duration_seconds:.0f}s)")
+#         logger.info(f"🎙️  STT Cost:     ₹{stt_cost_usd * exchange_rate:.4f} (${stt_cost_usd:.4f})")
+#         logger.info(f"🧠 LLM In:       ₹{llm_input_cost_usd * exchange_rate:.4f} (~{total_input_tokens:.0f} tokens)")
+#         logger.info(f"🧠 LLM Out:      ₹{llm_output_cost_usd * exchange_rate:.4f} (~{self.llm_output_tokens_est:.0f} tokens)")
+#         logger.info(f"🗣️  TTS Cost:     ₹{tts_cost_usd * exchange_rate:.4f} ({self.tts_chars} chars)")
+#         logger.info("-" * 55)
+#         logger.info(f"💵 TOTAL:        ₹{total_cost_inr:.4f} (${total_cost_usd:.4f})")
+#         logger.info(f"📊 PER MIN:      ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd:.4f})")
+#         logger.info("=" * 55 + "\n")
+
+
+# class PipecatBugFixProcessor(FrameProcessor):
+#     async def process_frame(self, frame: Frame, direction: FrameDirection):
+#         await super().process_frame(frame, direction)
+#         if isinstance(frame, AudioRawFrame):
+#             if not hasattr(frame, 'pts'):
+#                 frame.pts = None
+#             if not hasattr(frame, 'transport_destination'):
+#                 frame.transport_destination = None
+#             if not hasattr(frame, 'id'):
+#                 frame.id = "fixed-audio-frame-id"
+#             if not hasattr(frame, 'broadcast_sibling_id'):
+#                 frame.broadcast_sibling_id = None
+#         await self.push_frame(frame, direction)
+
+
+# class VobizFrameSerializer(FrameSerializer):
+#     def __init__(self, stream_sid: str = None):
+#         self.stream_sid = stream_sid
+
+#     async def serialize(self, frame: Frame) -> str | None:
+#         if isinstance(frame, AudioRawFrame):
+#             payload = base64.b64encode(frame.audio).decode("utf-8")
+#             vobiz_msg = {
+#                 "event": "playAudio",
+#                 "media": {
+#                     "payload": payload,
+#                     "contentType": "audio/x-l16",
+#                     "sampleRate": frame.sample_rate
+#                 }
+#             }
+#             return json.dumps(vobiz_msg)
+            
+#         elif isinstance(frame, CancelFrame):
+#             return json.dumps({"event": "clearAudio"}) 
+            
+#         return None
+
+#     async def deserialize(self, data: str | bytes) -> Frame | None:
+#         try:
+#             if isinstance(data, bytes):
+#                 data = data.decode("utf-8")
+#             msg = json.loads(data)
+#             event_type = msg.get("event")
+#             if event_type == "media":
+#                 payload = msg.get("media", {}).get("payload")
+#                 if payload:
+#                     audio_data = base64.b64decode(payload)
+#                     frame = AudioRawFrame(audio=audio_data, sample_rate=8000, num_channels=1)
+#                     if not hasattr(frame, 'id'): frame.id = "inbound-audio-id"
+#                     if not hasattr(frame, 'pts'): frame.pts = None
+#                     if not hasattr(frame, 'transport_destination'): frame.transport_destination = None
+#                     if not hasattr(frame, 'broadcast_sibling_id'): frame.broadcast_sibling_id = None
+#                     return frame
+#             elif event_type == "stop":
+#                 return CancelFrame()
+#         except Exception as e:
+#             logger.error(f"Error deserializing Vobiz frame: {e}")
+#         return None
+
+
+# # ==========================================================
+# # 🔌 VOBIZ REST API HANGUP HELPER
+# # ==========================================================
+# async def force_vobiz_hangup(call_uuid: str):
+#     if not call_uuid or call_uuid == "vobiz_call":
+#         return
+        
+#     auth_id = os.getenv("VOBIZ_AUTH_ID")
+#     auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
+    
+#     if not auth_id or not auth_token:
+#         logger.warning("⚠️ Missing VOBIZ_AUTH_ID or VOBIZ_AUTH_TOKEN in .env. Cannot forcefully hang up.")
+#         return
+        
+#     url = f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/{call_uuid}/"
+#     headers = {
+#         "X-Auth-ID": auth_id,
+#         "X-Auth-Token": auth_token
+#     }
+    
+#     try:
+#         async with aiohttp.ClientSession() as session:
+#             async with session.delete(url, headers=headers) as resp:
+#                 if resp.status in [200, 202, 204]:
+#                     logger.info(f"☎️ Call Terminated via API: {call_uuid}")
+#                 elif resp.status == 404:
+#                     logger.debug(f"☎️ Call {call_uuid} already ended normally.")
+#                 else:
+#                     logger.warning(f"⚠️ Hangup API returned status {resp.status} for {call_uuid}")
+#     except Exception as e:
+#         logger.error(f"❌ Failed to forcefully hang up Vobiz call: {e}")
+
+
+# # ==========================================================
+# # 💾 DB SAVING HELPER
+# # ==========================================================
+# # 👇 NEW: Extracts transcript, summarizes with Gemini, and saves to Postgres DB
+# async def save_call_log(call_sid: str, caller_number: str, duration: float, messages: list):
+#     logger.info(f"💾 Starting DB save for call {call_sid}...")
+#     try:
+#         # 1. Improved Transcript Extraction
+#         lines = []
+#         for m in messages:
+#             role = "AI" if m.get('role') == 'model' else "Patient"
+#             # Extract text from different possible Pipecat context structures
+#             content = ""
+#             if 'content' in m and isinstance(m['content'], str):
+#                 content = m['content']
+#             elif 'parts' in m:
+#                 for p in m['parts']:
+#                     if isinstance(p, dict) and 'text' in p:
+#                         content += p['text']
+#                     elif isinstance(p, str):
+#                         content += p
+            
+#             if content.strip():
+#                 lines.append(f"{role}: {content.strip()}")
+        
+#         transcript = "\n".join(lines)
+        
+#         # 2. Summarize using Gemini with your specific template
+#         if not lines:
+#             ai_summary = "Call connected but no speech detected."
+#         else:
+#             # 👇 STRICT TEMPLATE ENFORCEMENT
+#             prompt = f"""
+#             Analyze the following medical receptionist transcript and provide a summary strictly following this template:
+#             "Patient {{Name}} booked an appointment on {{Date}} at {{Time}} with {{Doctor Name}} ({{Specialization}}) due to {{Reason}}"
+
+#             Rules:
+#             - If no appointment was booked, write: "Patient called to inquire but no appointment was booked."
+#             - Translate any Telugu details into English for the summary.
+#             - Keep it to one single sentence.
+
+#             Transcript:
+#             {transcript}
+#             """
+            
+#             genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+#             model = genai.GenerativeModel("gemini-2.5-flash")
+#             response = await asyncio.to_thread(model.generate_content, prompt)
+#             ai_summary = response.text.strip() if response else "No summary generated."
+
+#         # 3. Insert into DB
+#         pool = get_pool()
+#         if not pool:
+#             logger.error("⚠️ No DB pool available.")
+#             return
+            
+#         async with pool.acquire() as conn:
+#             clinic_id = await conn.fetchval("SELECT id FROM clinics LIMIT 1")
+#             if not clinic_id:
+#                 logger.error("⚠️ No clinic found.")
+#                 return
+            
+#             await conn.execute("""
+#                 INSERT INTO calls (clinic_id, type, caller, agent_type, duration, ai_summary)
+#                 VALUES ($1, 'incoming', $2, 'ai', $3, $4)
+#             """, clinic_id, caller_number, int(duration), ai_summary)
+            
+#         logger.info(f"✅ Call Log Saved | Summary: {ai_summary}")
+#     except Exception as e:
+#         logger.error(f"❌ Failed to save call log: {e}", exc_info=True)
+
+# # ==========================================================
+# # 🎙️ PIPECAT RUNNER
+# # ==========================================================
+# # 👇 FIXED: Added caller_number so it saves correctly in DB
+# async def run_bot(transport: BaseTransport, call_sid: str = "local_test", caller_number: str = "Unknown"):
+#     await ensure_redis_client()
+#     session_id = call_sid[:8]
+
+#     google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+#     if not google_creds_path or not os.path.exists(google_creds_path):
+#         logger.error(f"🚨 Missing Google Credentials! Path: {google_creds_path}")
+
+#     stt = SarvamSTTService(
+#         api_key=os.getenv("SARVAM_API_KEY"),
+#         language="unknown",
+#         model="saaras:v3",
+#         mode="transcribe"
+#     )
+#     tts = GoogleTTSService(
+#         credentials_path=google_creds_path,
+#         voice="te-IN-Chirp3-HD-Despina",
+#         language="te-IN"
+#     )
+#     llm = GoogleLLMService(
+#         api_key=os.getenv("GEMINI_API_KEY"),
+#         model="gemini-2.5-flash"
+#     )
+
+#     register_all_tools(llm)
+
+#     context = LLMContext(
+#         messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}],
+#         tools=get_tools_schema()
+#     )
+#     context_aggregator = LLMContextAggregatorPair(context)
+#     billing_tracker = BillingTracker(context, session_id)
+
+#     pipeline = Pipeline([
+#         transport.input(),
+#         stt,
+#         STTTextCleanerProcessor(session_id),
+#         context_aggregator.user(),
+#         llm,
+#         billing_tracker,
+#         AutoLanguageProcessor(session_id),
+#         tts,
+#         PipecatBugFixProcessor(),
+#         transport.output(),
+#         context_aggregator.assistant()
+#     ])
+
+#     task = PipelineTask(
+#         pipeline,
+#         params=PipelineParams(
+#             audio_in_sample_rate=8000,
+#             audio_out_sample_rate=8000,
+#             enable_metrics=True,
+#             enable_usage_metrics=True
+#         )
+#     )
+
+#     @transport.event_handler("on_client_connected")
+#     async def on_client_connected(transport, client):
+#         await task.queue_frames([
+#             TTSSpeakFrame(
+#                 "నమస్కారం! మిత్ర హాస్పిటల్స్‌కు స్వాగతం. నేను మీకు ఎలా సహాయపడగలను?",
+#                 append_to_context=True
+#             )
+#         ])
+
+#     @transport.event_handler("on_client_disconnected")
+#     async def on_client_disconnected(transport, client):
+#         await task.cancel()
+
+#     runner = PipelineRunner(handle_sigint=False)
+#     await runner.run(task)
+#     billing_tracker.generate_receipt()
+
+#     # 👇 NEW: Fire off the database save after the call ends
+#     duration = time.time() - billing_tracker.start_time
+#     # We await this now so the process won't die before saving is done
+#     await save_call_log(call_sid, caller_number, duration, context.messages)
+
+
+# # ==========================================================
+# # 📞 TWILIO ROUTES
+# # ==========================================================
+
+# @router.post("/incoming")
+# # 👇 FIXED: Grab 'From' phone number from Twilio webhook
+# async def incoming_call(request: Request, From: str = Form("Unknown")):
+#     """
+#     Primary Twilio webhook — safely returns raw XML without relying on the Twilio SDK.
+#     """
+#     logger.info("📞 Incoming Twilio call webhook triggered!")
+    
+#     base_url = str(request.base_url).replace("http://", "wss://").replace("https://", "wss://").rstrip("/")
+#     wss_url = f"{base_url}/media"
+    
+#     # Passing the caller ID back to the socket
+#     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+# <Response>
+#     <Connect>
+#         <Stream url="{wss_url}">
+#             <Parameter name="caller" value="{From}" />
+#         </Stream>
+#     </Connect>
+# </Response>"""
+
+#     logger.info(f"📤 Sending XML to Twilio:\n{xml_response}")
+#     return Response(content=xml_response, media_type="text/xml")
+
+
+# @router.post("/voice")
+# async def voice_callback(request: Request):
+#     """Fallback route just in case Twilio is configured to /voice"""
+#     return await incoming_call(request)
+
+
+# @router.websocket("/media")
+# async def websocket_endpoint(websocket: WebSocket):
+#     await websocket.accept()
+#     logger.info("🔌 Twilio connected to /media WebSocket.")
+
+#     try:
+#         raw = await websocket.receive_text()
+#         data = json.loads(raw)
+        
+#         if data.get("event") == "connected":
+#             raw = await websocket.receive_text()
+#             data = json.loads(raw)
+
+#         if data.get("event") == "start":
+#             stream_sid = data["start"]["streamSid"]
+#             call_sid   = data.get("start", {}).get("callSid", "twilio_call")
+            
+#             # 👇 FIXED: Extract caller number from Twilio Stream parameters
+#             caller_number = data.get("start", {}).get("customParameters", {}).get("caller", "Unknown")
+            
+#             logger.info(f"🎙️  Twilio Stream started | streamSid={stream_sid} | callSid={call_sid} | Caller={caller_number}")
+            
+#             serializer = TwilioFrameSerializer(
+#                 stream_sid=stream_sid,
+#                 params=TwilioFrameSerializer.InputParams(auto_hang_up=False)
+#             )
+            
+#             transport = FastAPIWebsocketTransport(
+#                 websocket=websocket,
+#                 params=FastAPIWebsocketParams(
+#                     audio_in_enabled=True,
+#                     audio_out_enabled=True,
+#                     add_wav_header=False,
+#                     serializer=serializer
+#                 )
+#             )
+#             await run_bot(transport, call_sid=call_sid, caller_number=caller_number)
+#         else:
+#             await websocket.close()
+#     except Exception as e:
+#         logger.error(f"❌ Twilio WebSocket error: {e}", exc_info=True)
+        
+
+# # ==========================================================
+# # 📞 VOBIZ ROUTES
+# # ==========================================================
+# @router.post("/vobiz-events")
+# async def vobiz_events(request: Request):
+#     logger.info("📞 Incoming Vobiz call webhook triggered!")
+    
+#     body_bytes = await request.body()
+#     body_str = body_bytes.decode('utf-8')
+#     logger.info(f"📥 VOBIZ PAYLOAD: {body_str}")
+    
+#     if "ringing" in body_str.lower() or "initiated" in body_str.lower():
+#         return Response(content="<Response></Response>", media_type="text/xml")
+        
+#     if "event=hangup" in body_str.lower():
+#         logger.info("👋 Call has officially ended. Sending blank acknowledgement.")
+#         return Response(content="<Response></Response>", media_type="text/xml")
+    
+#     wss_url = "wss://gymnastic-oversentimentally-marcelino.ngrok-free.dev/vobiz-media"
+    
+#     xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+# <Response>
+#     <Speak>Connecting to AI.</Speak>
+#     <Stream bidirectional="true" keepCallAlive="true">{wss_url}</Stream>
+# </Response>"""
+
+#     return Response(content=xml_response, media_type="text/xml")
+
+# @router.websocket("/vobiz-media")
+# async def vobiz_websocket_endpoint(websocket: WebSocket):
+#     await websocket.accept()
+#     logger.info("🔌 Vobiz connected to /vobiz-media WebSocket.")
+#     call_sid = "vobiz_call"
+
+#     try:
+#         stream_sid = "vobiz_stream"
+#         caller_number = "Unknown"
+
+#         while True:
+#             raw = await websocket.receive_text()
+#             data = json.loads(raw)
+#             event_type = data.get("event")
+            
+#             if event_type == "connected":
+#                 continue 
+#             elif event_type == "start":
+#                 start_obj = data.get("start", {})
+#                 stream_sid = start_obj.get("streamId") or data.get("streamId") or "vobiz_stream"
+#                 call_sid = start_obj.get("callId") or data.get("callId") or "vobiz_call"
+#                 # 👇 FIXED: Extract caller number from Vobiz metadata
+#                 caller_number = start_obj.get("metadata", {}).get("from", "Unknown")
+#                 break
+#             elif event_type == "media":
+#                 break
+
+#         logger.info(f"🎙️  Vobiz Stream started | streamSid={stream_sid} | callSid={call_sid} | Caller={caller_number}")
+
+#         serializer = VobizFrameSerializer(stream_sid=stream_sid)
+        
+#         transport = FastAPIWebsocketTransport(
+#             websocket=websocket,
+#             params=FastAPIWebsocketParams(
+#                 audio_in_enabled=True,
+#                 audio_out_enabled=True,
+#                 add_wav_header=False,
+#                 serializer=serializer
+#             )
+#         )
+        
+#         await run_bot(transport, call_sid=call_sid, caller_number=caller_number)
+
+#     except Exception as e:
+#         logger.error(f"❌ Vobiz WebSocket error: {e}", exc_info=True)
+#     finally:
+#         try:
+#             await websocket.close()
+#         except:
+#             pass
+        
+#         await force_vobiz_hangup(call_sid)
+
+
+# # ==========================================================
+# # 💳 RAZORPAY WEBHOOK
+# # ==========================================================
+# @router.post("/razorpay-webhook")
+# async def razorpay_webhook(request: Request):
+#     try:
+#         payload = await request.json()
+#         event = payload.get("event")
+
+#         if event in ["payment_link.paid", "payment_link.cancelled", "payment_link.expired"]:
+#             entity = payload.get("payload", {}).get("payment_link", {}).get("entity", {})
+#             appointment_id = entity.get("notes", {}).get("appointment_id")
+
+#             if appointment_id:
+#                 from tools.pool import get_pool
+#                 pool = get_pool()
+#                 status = "paid" if event == "payment_link.paid" else "failed"
+
+#                 async with pool.acquire() as conn:
+#                     await conn.execute(
+#                         "UPDATE payments SET status = $1 WHERE appointment_id = $2",
+#                         status, appointment_id
+#                     )
+#                 logger.info(f"💳 Payment {event} → DB updated to '{status}' for {appointment_id}")
+
+#                 if event == "payment_link.paid":
+#                     await handle_successful_payment(appointment_id)
+
+#         return {"status": "ok"}
+#     except Exception as e:
+#         logger.error(f"❌ Razorpay Webhook Error: {e}")
+#         return {"status": "error"}

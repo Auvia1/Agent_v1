@@ -1,5 +1,4 @@
 #tools/booking.py
-#tools/booking.py
 import os
 import datetime
 import asyncio
@@ -7,6 +6,7 @@ import pytz
 from loguru import logger
 import redis.asyncio as redis
 from pipecat.services.llm_service import FunctionCallParams
+import difflib
  
 # ✅ Only one pool import — from tools.pool, NOT db.connection
 from tools.pool import get_pool
@@ -16,16 +16,36 @@ from tools.notify import send_confirmation
  
  
 async def cancel_unpaid_appointment(appointment_id: str):
-    """Background task to cancel appointments if not paid within 15 minutes."""
+    """Background task to cancel appointments and payments if not paid within 15 minutes."""
     logger.info(f"⏳ Timer started: Checking if {appointment_id} is paid in 15 minutes...")
-    await asyncio.sleep(900)
+    await asyncio.sleep(900) # 15 minutes
+    
     pool = get_pool()  # ✅ reuse singleton, no new pool
-    query = "UPDATE appointments SET status = 'cancelled', updated_at = NOW() WHERE id = $1::uuid AND status = 'pending' AND payment_status = 'unpaid'"
     try:
         async with pool.acquire() as conn:
-            await conn.execute(query, appointment_id)
+            # 1. Try to cancel the appointment IF it is still pending/unpaid
+            # We use RETURNING id to know if it actually updated (meaning it wasn't paid)
+            cancel_query = """
+                UPDATE appointments 
+                SET status = 'cancelled', updated_at = NOW() 
+                WHERE id = $1::uuid AND status = 'pending' AND payment_status = 'unpaid'
+                RETURNING id
+            """
+            cancelled_id = await conn.fetchval(cancel_query, appointment_id)
+            
+            # 2. If it was cancelled (meaning it wasn't paid in time), mark payment as 'failed'
+            if cancelled_id:
+                logger.warning(f"⏳ 15 mins passed. Cancelling unpaid appointment {appointment_id}")
+                await conn.execute(
+                    "UPDATE payments SET status = 'failed' WHERE appointment_id = $1::uuid",
+                    appointment_id
+                )
+                logger.info(f"🛑 Payment ledger marked as 'failed' for {appointment_id}")
+            else:
+                logger.info(f"✅ 15 min check: Appointment {appointment_id} was already paid or handled.")
+                
     except Exception as e:
-        logger.error(f"Error cancelling unpaid appointment: {e}")
+        logger.error(f"❌ Error cancelling unpaid appointment: {e}")
  
  
 async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: bool = False, is_same_patient: str = "unknown", existing_patient_id: str = None):
@@ -84,7 +104,14 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
             whatsapp_msg = f"🏥 *Mithra Hospitals*\n\nHi {clean_name}, your free 1-week follow-up is CONFIRMED for {start_dt.strftime('%I:%M %p')} on {start_dt.strftime('%B %d')}.\n\nNo payment is required. See you then!"
             await send_confirmation(clean_phone, whatsapp_msg)
             logger.info(f"✅ Free Follow-up booked: {appt_id}")
-            await params.result_callback({"status": "success", "appointment_id": str(appt_id), "is_followup": True})
+            
+            # 🚨 UPDATED: Tell LLM to keep the call alive and ask for further queries
+            await params.result_callback({
+                "status": "success", 
+                "appointment_id": str(appt_id), 
+                "is_followup": True,
+                "message": "SYSTEM DIRECTIVE: The booking is complete and the message was sent. Tell the user the booking is confirmed, and then explicitly ask: 'Is there anything else I can help you with today?' Do NOT end the call."
+            })
             return
  
         # 🟢 Logic Branch B: Standard Paid Appointment
@@ -100,7 +127,13 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         # Fire the 15-minute cancellation timer in the background
         asyncio.create_task(cancel_unpaid_appointment(str(appt_id)))
  
-        await params.result_callback({"status": "success", "appointment_id": str(appt_id), "is_followup": False})
+        # 🚨 UPDATED: Tell LLM to keep the call alive and ask for further queries
+        await params.result_callback({
+            "status": "success", 
+            "appointment_id": str(appt_id), 
+            "is_followup": False,
+            "message": "SYSTEM DIRECTIVE: The booking is tentatively held. Tell the user the payment link was sent via WhatsApp, and then explicitly ask: 'Is there anything else I can help you with today?' Do NOT end the call."
+        })
  
     except Exception as e:
         logger.error(f"❌ Exception during booking: {e}")
@@ -154,36 +187,49 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
             existing_patients = await conn.fetch(patient_check_query, clean_phone, clinic_id)
             
             if existing_patients:
-                db_names = [p['name'] for p in existing_patients]
-                names_str = ", ".join(db_names)
-                
-                # Check for an exact or fuzzy match
                 best_match_id = None
-                for p in existing_patients:
-                    db_name_lower = p['name'].lower()
-                    input_name_lower = patient_name.lower()
-                    if db_name_lower == input_name_lower or db_name_lower in input_name_lower or input_name_lower in db_name_lower:
-                        best_match_id = str(p['id'])
-                        break
+                best_match_name = None
+                highest_score = 0.0
                 
+                # 1. Apply 70% Fuzzy Match Logic
+                for p in existing_patients:
+                    db_name = p['name'].lower()
+                    input_name = patient_name.lower()
+                    
+                    # Calculate similarity ratio (0.0 to 1.0)
+                    similarity = difflib.SequenceMatcher(None, db_name, input_name).ratio()
+                    
+                    # Substring fallback (handles "Hari Ram" vs "Hari Ram Varma")
+                    is_substring = db_name in input_name or input_name in db_name
+                    
+                    # 2. Threshold Check (70% or exact substring)
+                    if similarity >= 0.70 or is_substring:
+                        if similarity > highest_score:
+                            highest_score = similarity
+                            best_match_id = str(p['id'])
+                            best_match_name = p['name']
+                
+                # 3. Route the Conversation
                 if is_same_patient == "unknown":
-                    # If the name is totally new, ask the family question!
-                    if not best_match_id:
-                        logger.warning(f"🛑 SMART INTERCEPT: Family mismatch. DB: {names_str}, Input: {patient_name}")
+                    if best_match_id:
+                        # We found a strong match (e.g., Hari Ram). Ignore Hemanth. Ask to update.
+                        logger.warning(f"🛑 SMART INTERCEPT: High match. DB: {best_match_name}, Input: {patient_name}")
                         await params.result_callback({
                             "status": "warning", 
-                            "message": f"SYSTEM DIRECTIVE: Tell the user: 'We already have patients named {names_str} registered with this phone number. Are you one of them updating your name, or a new family member?'"
+                            "message": f"SYSTEM DIRECTIVE: Tell the user: 'I see a patient profile for {best_match_name} under this number. Should I update this profile to {patient_name}, or is this a completely new patient?'"
                         })
                         return
                     else:
-                        existing_patient_id = best_match_id
+                        # No matches > 70% (e.g., caller said a totally new name).
+                        # Let it pass through silently to create a new profile.
+                        pass
                 
                 elif is_same_patient == "yes":
-                    # User confirmed they are an existing patient. Link to the closest match.
+                    # User confirmed it's them. Pass the ID down so db/queries.py updates the name.
                     existing_patient_id = best_match_id if best_match_id else str(existing_patients[0]['id'])
                 
                 elif is_same_patient == "no":
-                    # User confirmed they are a new family member
+                    # User said they are a new patient.
                     existing_patient_id = None
  
             # 2. Intercept 2: Check for existing upcoming appointments

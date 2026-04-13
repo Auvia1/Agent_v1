@@ -1,4 +1,4 @@
-#main.py
+# main.py
 import os
 import hmac
 import hashlib
@@ -19,6 +19,38 @@ import call_agent
 
 load_dotenv(override=True)
 
+# ==========================================================
+# 📋 LOGGING CONFIGURATION - Logs to file + console
+# ==========================================================
+import sys
+from pathlib import Path
+
+# Create logs directory if it doesn't exist
+logs_dir = Path("logs")
+logs_dir.mkdir(exist_ok=True)
+
+# Remove default handler and add file + console handlers
+logger.remove()
+
+# Console output (stdout)
+logger.add(
+    sys.stdout,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="INFO"
+)
+
+# File output with rotation
+logger.add(
+    logs_dir / "app_{time:YYYY-MM-DD}.log",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="DEBUG",
+    rotation="500 MB",  # Rotate when file reaches 500MB
+    retention="7 days",  # Keep logs for 7 days
+    compression="zip"  # Compress rotated files
+)
+
+logger.info("✅ File logging initialized at ./logs/app_{date}.log")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("⚙️ Initializing DB and Redis...")
@@ -26,6 +58,7 @@ async def lifespan(app: FastAPI):
     init_tool_db(pool)
     await whatsapp_agent.ensure_redis_client()
     await call_agent.ensure_redis_client()
+    
     logger.info("✅ All services initialized.")
     yield
     if whatsapp_agent.redis_client: await whatsapp_agent.redis_client.close()
