@@ -65,7 +65,7 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         # Prevent double-booking race conditions
         lock_acquired = await redis_client.set(lock_key, "locked", nx=True, ex=10)
         if not lock_acquired:
-            await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user: 'Another patient just grabbed that exact time slot! Shall I find the next available one?'"})
+            await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user: 'Another patient just grabbed that exact time slot/session! Shall I find the next available one?'"})
             return
  
         pool = get_pool()  # ✅ reuse singleton
@@ -76,7 +76,7 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
             # 🛑 ADD THIS CHECK: Don't proceed if clinic_id is None
             if not clinic_id:
                 logger.error("🚨 Execution aborted: clinic_id is None (Doctor not found).")
-                await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: The doctor ID was invalid. Please apologize to the user and ask them to select the time slot again."})
+                await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: The doctor ID was invalid. Please apologize to the user and ask them to select the time again."})
                 return
             
             # ✅ Pass the family logic down to the query
@@ -85,7 +85,8 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         start_dt = datetime.datetime.fromisoformat(start_time_iso)
         end_dt = start_dt + datetime.timedelta(minutes=30)
  
-        appt_id = await book_new_appointment(
+        # 👇 UPDATED: Unpack appt_id, token_number, AND is_slots_needed
+        appt_id, token_number, is_slots_needed = await book_new_appointment(
             pool=pool, clinic_id=clinic_id, doctor_id=doctor_id,
             patient_name=clean_name, phone=clean_phone, start_time=start_dt,
             end_time=end_dt, force_book=force_book, patient_id=patient_id,
@@ -93,19 +94,20 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         )
  
         if str(appt_id) == "ALREADY_BOOKED_BY_USER":
-            await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user they already have an appointment booked at this time."})
+            await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user they already have an appointment booked for this session/time."})
             return
         elif str(appt_id) == "SLOT_TAKEN":
             await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user this slot was just taken and ask them to choose another time."})
             return
+
+        time_display = f"Session starting at {start_dt.strftime('%I:%M %p')}" if not is_slots_needed else f"{start_dt.strftime('%I:%M %p')}"
  
-        # 🟢 Logic Branch A: Free Follow-up
+        # 🟢 Logic Branch A: Free Follow-up (Token generated instantly)
         if is_followup:
-            whatsapp_msg = f"🏥 *Mithra Hospitals*\n\nHi {clean_name}, your free 1-week follow-up is CONFIRMED for {start_dt.strftime('%I:%M %p')} on {start_dt.strftime('%B %d')}.\n\nNo payment is required. See you then!"
+            token_display = f"\n🔢 *Token Number:* {token_number}" if token_number else ""
+            whatsapp_msg = f"🏥 *Mithra Hospitals*\n\nHi {clean_name}, your free 1-week follow-up is CONFIRMED for {time_display} on {start_dt.strftime('%B %d')}.{token_display}\n\nNo payment is required. See you then!"
             await send_confirmation(clean_phone, whatsapp_msg)
-            logger.info(f"✅ Free Follow-up booked: {appt_id}")
             
-            # 🚨 UPDATED: Tell LLM to keep the call alive and ask for further queries
             await params.result_callback({
                 "status": "success", 
                 "appointment_id": str(appt_id), 
@@ -114,20 +116,20 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
             })
             return
  
-        # 🟢 Logic Branch B: Standard Paid Appointment
+        # 🟢 Logic Branch B: Standard Paid Appointment (Token generated AFTER payment)
         consultation_fee = 500
         payment_link = await generate_payment_link(consultation_fee, clean_phone, str(appt_id), clean_name)
  
         if payment_link:
-            whatsapp_msg = f"🏥 *Mithra Hospitals*\n\nHi {clean_name}, your appointment is tentatively booked for {start_dt.strftime('%I:%M %p')} on {start_dt.strftime('%B %d')}.\n\nPlease pay ₹{consultation_fee} using this link to confirm your slot (Valid for 15 mins): {payment_link}"
+            # 👇 Inform the user about the deferred token
+            token_notice = "\n*(Your Token Number will be generated instantly after payment)*" if not is_slots_needed else ""
+            whatsapp_msg = f"🏥 *Mithra Hospitals*\n\nHi {clean_name}, your appointment is tentatively booked for {time_display} on {start_dt.strftime('%B %d')}.\n\nPlease pay ₹{consultation_fee} using this link to confirm your slot (Valid for 15 mins): {payment_link}{token_notice}"
             await send_confirmation(clean_phone, whatsapp_msg)
  
-        logger.info(f"✅ Standard Appointment booked: {appt_id}")
+        logger.info(f"✅ Standard Appointment held pending payment: {appt_id}")
  
-        # Fire the 15-minute cancellation timer in the background
         asyncio.create_task(cancel_unpaid_appointment(str(appt_id)))
  
-        # 🚨 UPDATED: Tell LLM to keep the call alive and ask for further queries
         await params.result_callback({
             "status": "success", 
             "appointment_id": str(appt_id), 
@@ -140,7 +142,6 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Tell the user a system error occurred and to please call the clinic directly."})
     finally:
         await redis_client.close()
- 
  
 # ==========================================================
 # 🧠 MAIN LLM TOOL ENTRYPOINT (Smart Intercept)

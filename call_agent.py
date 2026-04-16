@@ -54,7 +54,7 @@ load_dotenv(override=True)
 
 # 👇 FIXED: Global LLM Initialization for the Summarizer
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-summarizer_model = genai.GenerativeModel("gemini-1.5-flash")
+summarizer_model = genai.GenerativeModel("gemini-2.5-flash")
 
 router = APIRouter()
 redis_client = None
@@ -253,9 +253,13 @@ class BillingTracker(FrameProcessor):
         llm_input_cost_usd = total_input_tokens * 0.0000003
         llm_output_cost_usd = self.llm_output_tokens_est * 0.0000025
         total_cost_usd = stt_cost_usd + tts_cost_usd + llm_input_cost_usd + llm_output_cost_usd
-        exchange_rate = 83.5
+        
+        # 👇 FIX: Explicitly calculate and define the USD cost per minute
+        cost_per_minute_usd = total_cost_usd / duration_minutes if duration_minutes > 0 else 0
+        
+        exchange_rate = 93.29
         total_cost_inr = total_cost_usd * exchange_rate
-        cost_per_minute_inr = (total_cost_usd / duration_minutes if duration_minutes > 0 else 0) * exchange_rate
+        cost_per_minute_inr = cost_per_minute_usd * exchange_rate
 
         logger.info("\n" + "=" * 55)
         logger.info(f"[{self.session_id}] 💰 SESSION BILLING RECEIPT 💰")
@@ -267,7 +271,8 @@ class BillingTracker(FrameProcessor):
         logger.info(f"🗣️  TTS Cost:     ₹{tts_cost_usd * exchange_rate:.4f} ({self.tts_chars} chars)")
         logger.info("-" * 55)
         logger.info(f"💵 TOTAL:        ₹{total_cost_inr:.4f} (${total_cost_usd:.4f})")
-        logger.info(f"📊 PER MIN:      ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd * exchange_rate:.4f})")
+        # 👇 FIX: Print the actual USD variable without multiplying it by the exchange rate again
+        logger.info(f"📊 PER MIN:      ₹{cost_per_minute_inr:.4f} (${cost_per_minute_usd:.4f})")
         logger.info("=" * 55 + "\n")
 
 class PipecatBugFixProcessor(FrameProcessor):

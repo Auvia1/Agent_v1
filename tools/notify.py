@@ -272,22 +272,43 @@ async def send_interactive_slots(phone_number: str, doc_name: str, date_str: str
 # 💳 PAYMENT CONFIRMATION HANDLER
 # ==========================================================
 async def handle_successful_payment(appointment_id: str):
-    """Updates the DB to 'paid' and triggers the final WhatsApp receipt."""
+    """Updates the DB to 'paid', generates the Token Number, and triggers the final WhatsApp receipt."""
     try:
-        pool = get_pool()  # ✅ reuse singleton
+        pool = get_pool()  
         async with pool.acquire() as conn:
-            # 1. Mark appointment as paid and confirmed
+            # 1. Fetch appointment details and lock the row to prevent race conditions during token generation
+            record_query = """
+                SELECT a.doctor_id, a.appointment_start, cs.is_slots_needed, a.token_number
+                FROM appointments a JOIN clinic_settings cs ON cs.clinic_id = a.clinic_id
+                WHERE a.id = $1::uuid FOR UPDATE OF a
+            """
+            appt_record = await conn.fetchrow(record_query, appointment_id)
+            if not appt_record: return
+
+            new_token = appt_record['token_number']
+
+            # 2. Generate token IF it's a token clinic and one hasn't been assigned yet
+            if not appt_record['is_slots_needed'] and new_token is None:
+                token_query = """
+                    SELECT COALESCE(MAX(token_number), 0) + 1 
+                    FROM appointments 
+                    WHERE doctor_id = $1::uuid 
+                      AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata')
+                      AND appointment_start::time = $2::time
+                      AND deleted_at IS NULL AND token_number IS NOT NULL
+                """
+                new_token = await conn.fetchval(token_query, appt_record['doctor_id'], appt_record['appointment_start'])
+
+            # 3. Mark Paid and Save Token
             await conn.execute(
-                "UPDATE appointments SET status = 'confirmed', payment_status = 'paid', updated_at = NOW() WHERE id = $1::uuid",
-                appointment_id
+                "UPDATE appointments SET status = 'confirmed', payment_status = 'paid', updated_at = NOW(), token_number = $2 WHERE id = $1::uuid",
+                appointment_id, new_token
             )
 
-            # 2. Fetch data for the WhatsApp confirmation
+            # 4. Fetch the final data for the WhatsApp Receipt
             query = """
-                SELECT p.name as patient_name, p.phone, d.name as doctor_name, a.reason, a.appointment_start
-                FROM appointments a
-                JOIN patients p ON a.patient_id = p.id
-                JOIN doctors d ON a.doctor_id = d.id
+                SELECT p.name as patient_name, p.phone, d.name as doctor_name, a.reason, a.appointment_start, a.token_number
+                FROM appointments a JOIN patients p ON a.patient_id = p.id JOIN doctors d ON a.doctor_id = d.id
                 WHERE a.id = $1::uuid
             """
             record = await conn.fetchrow(query, appointment_id)
@@ -296,18 +317,21 @@ async def handle_successful_payment(appointment_id: str):
                 ist = pytz.timezone('Asia/Kolkata')
                 appt_time = record['appointment_start'].astimezone(ist).strftime('%B %d, %Y at %I:%M %p')
 
+                # Dynamically show token if it exists
+                token_text = f"🔢 *Token Number:* {record['token_number']}\n" if record['token_number'] else ""
+                
                 whatsapp_msg = (
-                    "✅ *Booking Confirmed!*\n\n"
+                    "✅ *Booking Confirmed & Paid!*\n\n"
                     f"👤 *Name:* {record['patient_name']}\n"
                     f"📱 *Phone:* {record['phone']}\n"
                     f"👨‍⚕️ *Doctor:* {record['doctor_name']}\n"
-                    f"🩺 *Reason:* {record['reason']}\n"
+                    f"{token_text}"
                     f"📅 *Time:* {appt_time}\n\n"
-                    "Thank you for choosing Mithra Hospitals!"
+                    "Thank you for choosing us! Please present this message at the front desk."
                 )
 
                 await send_confirmation(record['phone'], whatsapp_msg)
-                logger.info(f"✅ Final WhatsApp confirmation sent to {record['phone']}")
+                logger.info(f"✅ Final WhatsApp confirmation sent to {record['phone']} | Token: {record['token_number']}")
 
     except Exception as e:
         logger.error(f"❌ Database error processing successful payment: {e}")
