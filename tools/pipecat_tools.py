@@ -94,7 +94,10 @@ voice_book_appointment_schema = FunctionSchema(
     properties={
         "doctor_id": {"type": "string", "description": "The exact 36-character UUID of the doctor."},
         "patient_name": {"type": "string", "description": "The name of the patient. CRITICAL: MUST be translated to plain English characters (e.g., 'Ravi', NOT 'రవి')."},
-        "start_time_iso": {"type": "string", "description": "The start time in ISO 8601 format."},
+        "start_time_iso": {
+            "type": "string", 
+            "description": "The start time in ISO 8601 format (e.g., '2026-04-18T17:00:00'). CRITICAL: You must use the strict YYYY-MM-DDTHH:MM:SS format. NEVER use literal words like 'TODAY' or 'TOMORROW' in this field."
+        },
         "phone": {"type": "string", "description": "The 10-digit phone number."},
         "reason": {"type": "string", "description": "The medical problem or symptoms. CRITICAL: MUST be translated to plain English (e.g., 'fever and cold', NOT 'జ్వరం, జలుబు')."},
         "force_book": {"type": "boolean", "description": "Set to true ONLY if the user explicitly confirmed they want to overwrite/add to their existing appointment."},

@@ -289,12 +289,13 @@ async def handle_successful_payment(appointment_id: str):
 
             # 2. Generate token IF it's a token clinic and one hasn't been assigned yet
             if not appt_record['is_slots_needed'] and new_token is None:
+                # 👇 FIXED: Token counter strictly bound to Date AND Shift Time
                 token_query = """
                     SELECT COALESCE(MAX(token_number), 0) + 1 
                     FROM appointments 
                     WHERE doctor_id = $1::uuid 
                       AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata')
-                      AND appointment_start::time = $2::time
+                      AND (appointment_start AT TIME ZONE 'Asia/Kolkata')::time = ($2 AT TIME ZONE 'Asia/Kolkata')::time
                       AND deleted_at IS NULL AND token_number IS NOT NULL
                 """
                 new_token = await conn.fetchval(token_query, appt_record['doctor_id'], appt_record['appointment_start'])
@@ -317,7 +318,6 @@ async def handle_successful_payment(appointment_id: str):
                 ist = pytz.timezone('Asia/Kolkata')
                 appt_time = record['appointment_start'].astimezone(ist).strftime('%B %d, %Y at %I:%M %p')
 
-                # Dynamically show token if it exists
                 token_text = f"🔢 *Token Number:* {record['token_number']}\n" if record['token_number'] else ""
                 
                 whatsapp_msg = (

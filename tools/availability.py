@@ -116,14 +116,6 @@ from pipecat.services.llm_service import FunctionCallParams
 from tools.pool import get_pool
 from db.queries import get_clinic_id
 
-import pytz
-import datetime
-from dateutil import parser as date_parser
-from loguru import logger
-from pipecat.services.llm_service import FunctionCallParams
-from tools.pool import get_pool
-from db.queries import get_clinic_id
-
 async def check_availability(params: FunctionCallParams, problem_or_speciality: str, requested_date: str = None):
     logger.info(f"🔍 Tool Call: check_availability for '{problem_or_speciality}' | Date: {requested_date}")
     
@@ -182,9 +174,9 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
             else:
                 doctors_map[doc_id]["schedules"][dow].append((r['start_time'], r['end_time'], r['max_appointments_per_slot']))
 
-        # 3. Check days for availability (ONLY TODAY AND TOMORROW -> range(2))
+        # 3. Check days for availability
         for doc_id, doc_data in doctors_map.items():
-            for days_checked in range(2): # 👈 Restricted to 2 days max
+            for days_checked in range(2): # Check today and tomorrow
                 check_dt = now + datetime.timedelta(days=days_checked)
                 check_date_obj = check_dt.date()
                 if target_date and check_date_obj != target_date: continue
@@ -195,8 +187,12 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                     timeoff_query = "SELECT start_time AT TIME ZONE 'Asia/Kolkata' as off_start, end_time AT TIME ZONE 'Asia/Kolkata' as off_end FROM doctor_time_off WHERE doctor_id = $1::uuid AND DATE(start_time AT TIME ZONE 'Asia/Kolkata') = $2"
                     time_offs = await conn.fetch(timeoff_query, doc_id, check_date_obj)
                     
-                    target_day_str = "TODAY" if (check_date_obj == now.date()) else check_dt.strftime('%A, %B %d (Tomorrow)')
+                    target_day_str = "TODAY" if (check_date_obj == now.date()) else check_dt.strftime('%A, %B %d')
 
+                    available_slots = []
+                    valid_sessions = []
+
+                    # 👇 NEW: Loop through ALL shifts for the day before returning
                     for shift in doc_data["schedules"][pg_dow]:
                         start_time = shift[0]
                         end_time = shift[1]
@@ -204,20 +200,14 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                         shift_start_dt = datetime.datetime.combine(check_date_obj, start_time)
                         shift_end_dt = datetime.datetime.combine(check_date_obj, end_time)
 
-                        # --- TIME OFF FILTER ---
                         is_shift_blocked = any(off["off_start"] <= shift_start_dt and off["off_end"] >= shift_end_dt for off in time_offs)
                         if is_shift_blocked:
                             continue 
 
-                        # --- PAST SHIFT FILTER (CRITICAL FIX FOR NIGHT CALLS) ---
-                        # If the current time is past the shift's end time for today, skip it and look to tomorrow
                         if check_date_obj == now.date() and shift_end_dt.time() <= now.time():
                             continue
 
-                        available_slots = []
-
                         if is_slots_needed:
-                            # 🟢 SLOT BASED
                             slot_duration = shift[2]
                             booked_query = "SELECT TO_CHAR(appointment_start AT TIME ZONE 'Asia/Kolkata', 'HH12:MI AM') as time_str FROM appointments WHERE doctor_id = $1::uuid AND deleted_at IS NULL AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = $2 AND status IN ('confirmed', 'pending')"
                             booked_records = await conn.fetch(booked_query, doc_id, check_date_obj)
@@ -226,19 +216,11 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                             current_dt = shift_start_dt
                             while current_dt < shift_end_dt:
                                 time_formatted = current_dt.strftime("%I:%M %p")
-                                # Ensure we don't offer exact slots that have already passed today
                                 if time_formatted not in booked_times and not (check_date_obj == now.date() and current_dt.time() <= now.time()):
                                     available_slots.append(time_formatted)
                                 current_dt += datetime.timedelta(minutes=slot_duration)
-                            
-                            if available_slots:
-                                system_directive = f"Inform the user: {doc_data['name']} works from {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}. The next available slot on {target_day_str} is at {available_slots[0]}. Ask if they want to book this."
-                                await params.result_callback({"status": "success", "all_available_slots": available_slots, "system_directive": system_directive})
-                                return
                         else:
-                            # 🔵 TOKEN BASED
                             max_cap = shift[2]
-                            
                             token_count_query = "SELECT COUNT(id) FROM appointments WHERE doctor_id = $1::uuid AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = $2 AND appointment_start::time = $3 AND deleted_at IS NULL AND status IN ('confirmed', 'pending')"
                             current_tokens = await conn.fetchval(token_count_query, doc_id, check_date_obj, start_time)
                             
@@ -246,22 +228,32 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                                 session_start = start_time.strftime("%I:%M %p")
                                 session_end = end_time.strftime("%I:%M %p")
                                 available_slots.append(session_start) 
-                                
-                                # If it's tomorrow, explicitly mention why today is skipped
-                                if check_date_obj != now.date():
-                                    system_directive = f"Inform the user: The doctor is not available for the rest of today. However, for tomorrow ({target_day_str}), we have tokens available for the {session_start} to {session_end} session. Ask if they want to book a token for tomorrow."
-                                else:
-                                    system_directive = f"Inform the user: We use a Token System. {doc_data['name']} is available TODAY from {session_start} to {session_end}. Ask if they want to book a token."
-                                
-                                await params.result_callback({
-                                    "status": "success",
-                                    "doctor_id": doc_id,
-                                    "doctor_name": doc_data["name"],
-                                    "target_date": target_day_str,
-                                    "is_token_based": True,
-                                    "all_available_slots": available_slots,
-                                    "system_directive": system_directive
-                                })
-                                return 
+                                valid_sessions.append(f"{session_start} to {session_end}")
+                    
+                    # 👇 Now that we collected all shifts for this day, construct the message
+                    if available_slots:
+                        doc_name = doc_data['name']
+                        doc_spec = doc_data['speciality'] # 👈 Grab the specialization
+                        
+                        if is_slots_needed:
+                            slots_str = ", ".join(available_slots[:3]) 
+                            system_directive = f"Inform the user: {doc_name}, our {doc_spec}, is available on {target_day_str}. The next available slots are {slots_str}. Ask if they want to book one of these."
+                        else:
+                            sessions_str = " and ".join(valid_sessions) 
+                            if check_date_obj != now.date() and not target_date:
+                                system_directive = f"Inform the user: The doctor is not available for the rest of today. However, for tomorrow ({target_day_str}), {doc_name} ({doc_spec}) has tokens available for the {sessions_str} sessions. CRITICAL RULE: DO NOT ask the user what specific time they will come. Just ask which session they prefer."
+                            else:
+                                system_directive = f"Inform the user: We use a Token System. {doc_name}, our {doc_spec}, is available on {target_day_str} for the {sessions_str} sessions. CRITICAL RULE: DO NOT ask the user what specific time they will come. Just ask if they want to book this session."
+                        await params.result_callback({
+                            "status": "success",
+                            "doctor_id": doc_id,
+                            "doctor_name": doc_name,
+                            # 👇 FIX: Give the LLM the strict machine-readable date (e.g., "2026-04-18")
+                            "target_date": check_date_obj.isoformat(), 
+                            "is_token_based": not is_slots_needed,
+                            "all_available_slots": available_slots,
+                            "system_directive": system_directive
+                        })
+                        return
                     
     await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: Inform the user that the doctor is fully booked or unavailable for today and tomorrow. Ask them to try calling back later."})

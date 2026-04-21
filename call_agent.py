@@ -84,15 +84,17 @@ CURRENT LIVE TIME: {current_time}
 You transition strictly through phases. NEVER backtrack.
 
 --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
-1. STRICT LANGUAGE LOCK: Your default and locked language is Telugu. Even if the user speaks English words or Hindi words (e.g., "book cheyandi", "10 o clock", "haan"), YOU MUST IGNORE IT AND REPLY IN TELUGU ONLY.
-2. EXPLICIT INTENT TO SWITCH: NEVER change languages unless the user explicitly commands you to change the language.
-3. PURITY OF LANGUAGE: Do not write English words in your Telugu responses.
-4. IGNORE TRANSLITERATION: The STT engine may write English words in Telugu script. Treat it as the locked language.
-5. DATABASE TRANSLATION (CRITICAL): ALL data sent to your internal tools (like patient_name, reason) MUST be translated to plain ENGLISH.
-6. TIME FORMATTING: Translate all digits into spelled-out phonetic words. For Telugu, say "ఉదయం తొమ్మిది గంటలకు". NEVER output raw digits like "09:00".
-7. PHONE NUMBER SPELLING (CRITICAL): When repeating a phone number to confirm, spell out EACH digit individually phonetically. E.g., for 830, say "ఎనిమిది మూడు సున్నా...". NEVER say "ఎనభై మూడు" (eighty-three).
-8. RESPECTFUL VOCABULARY: NEVER use the Telugu word "రోగి" (rogi). Always use the English word "patient".
-9. PACE & SPEED: Keep all your sentences extremely short, crisp, and punchy. Avoid long explanations.
+1. STARTING LANGUAGE: You start the conversation in Telugu.
+2. CASUAL MIXING: If the user casually uses English or Hindi words (e.g., "book cheyandi", "10 o clock", "haan"), DO NOT switch languages. Continue replying in your current language.
+3. EXPLICIT LANGUAGE SWITCHING (CRITICAL): If the user EXPLICITLY commands you to change the language (e.g., "Can you talk in English?", "Speak in Hindi"):
+   - You MUST immediately switch your text output to the requested language.
+   - You MUST acknowledge the switch (e.g., "Sure, I can speak in English.")
+   - You MUST repeat the exact question you were just asking. DO NOT hallucinate symptoms or skip steps. DO NOT call `check_availability` unless the user actually stated their medical problem.
+4. DATABASE TRANSLATION (CRITICAL): ALL data sent to your internal tools (like patient_name, reason) MUST be translated to plain ENGLISH.
+5. TIME FORMATTING: Translate all digits into spelled-out phonetic words in your active language.
+6. PHONE NUMBER SPELLING (CRITICAL): When repeating a phone number to confirm, spell out EACH digit individually phonetically.
+7. RESPECTFUL VOCABULARY: Always use the English word "patient" (even when speaking Telugu or Hindi).
+8. PACE & SPEED: Keep all your sentences extremely short, crisp, and punchy. Avoid long explanations.
 
 --- 🛠️ FAQ & DOCUMENT LOOKUP ---
 If at ANY point the user asks a general question about clinic policies, surgeries, cancellations, or doctors:
@@ -115,7 +117,7 @@ ONLY AFTER the user gives symptoms, SILENTLY call `check_availability`. Emit ZER
 
 PHASE 2 (Offer & Negotiation):
 - Initial Offer: Read the `system_directive` exactly as intended. Look at `all_available_slots` to find alternative times if asked.
-
+- TOKEN SYSTEM RULE: If the system directive mentions a "Token System" or "Session", DO NOT ask the user what exact time they will arrive. If they agree to the session, accept it and immediately move to PHASE 3.
 PHASE 3 (Details Request):
 If the user agrees to a slot, ask: "Could you please tell me the patient's name and 10-digit phone number?"
 
@@ -133,7 +135,7 @@ PHASE 5 (Confirmation & Persistence):
 ONLY AFTER the tool returns "success", inform the patient.
 - For a paid appointment, say EXACTLY the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
 - CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
-- ONLY call `end_call` if the user explicitly says they are done or says goodbye.
+- CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST first say a polite thank you and goodbye in your active language, and THEN call `end_call`.
 """
 
 # ==========================================================
@@ -546,7 +548,296 @@ async def razorpay_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Razorpay Webhook Error: {e}")
         return {"status": "error"}
+    
+# ==========================================================
+# 🧪 LOCAL TESTING UI (FREE & BROWSER BASED)
+# ==========================================================
 
+class WebTestSerializer(FrameSerializer):
+    def __init__(self):
+        pass
+
+    async def serialize(self, frame: Frame) -> str | None:
+        if isinstance(frame, AudioRawFrame):
+            payload = base64.b64encode(frame.audio).decode("utf-8")
+            return json.dumps({"event": "media", "payload": payload})
+        elif isinstance(frame, TextFrame):
+            # 👇 Emits the AI's spoken text so you can read it in the chat
+            return json.dumps({"event": "text", "text": frame.text, "sender": "ai"})
+        elif isinstance(frame, CancelFrame):
+            return json.dumps({"event": "stop"})
+        return None
+
+    async def deserialize(self, data: str | bytes) -> Frame | None:
+        try:
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            msg = json.loads(data)
+            
+            # 1. TEXT INPUT (Simulating STT)
+            if msg.get("event") == "text":
+                return TranscriptionFrame(
+                    text=msg.get("text", ""), 
+                    user_id="web_tester", 
+                    timestamp=datetime.now().isoformat()
+                )
+                
+            # 2. ACTUAL VOICE INPUT (Real STT via Microphone)
+            elif msg.get("event") == "media":
+                payload = msg.get("payload")
+                if payload:
+                    audio_data = base64.b64decode(payload)
+                    frame = AudioRawFrame(audio=audio_data, sample_rate=8000, num_channels=1)
+                    if not hasattr(frame, 'id'): frame.id = "inbound-audio-id"
+                    if not hasattr(frame, 'pts'): frame.pts = None
+                    if not hasattr(frame, 'transport_destination'): frame.transport_destination = None
+                    if not hasattr(frame, 'broadcast_sibling_id'): frame.broadcast_sibling_id = None
+                    return frame
+                    
+            elif msg.get("event") == "stop":
+                return CancelFrame()
+        except Exception as e:
+            logger.error(f"Test UI Deserialization error: {e}")
+        return None
+
+@router.get("/test-ui")
+async def get_test_ui():
+    """Serves a Hybrid UI to test both Chat (Text) and Voice (STT+TTS)."""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Mithra AI Tester</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 650px; margin: 40px auto; padding: 20px; background: #f4f7f6; }
+            h2 { color: #2c3e50; text-align: center; }
+            #chat { background: white; height: 450px; overflow-y: auto; padding: 15px; border-radius: 8px; border: 1px solid #ddd; margin-bottom: 15px; display: flex; flex-direction: column;}
+            .msg { margin-bottom: 10px; padding: 10px 14px; border-radius: 15px; max-width: 80%; line-height: 1.4; font-size: 15px; }
+            .msg.user { background: #007bff; color: white; align-self: flex-end; border-bottom-right-radius: 2px;}
+            .msg.ai { background: #e9ecef; color: black; align-self: flex-start; border-bottom-left-radius: 2px;}
+            .controls { display: flex; gap: 10px; align-items: center;}
+            input { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 15px;}
+            button { padding: 12px 20px; border: none; color: white; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px;}
+            button:disabled { background: #ccc !important; cursor: not-allowed; }
+            #sendBtn { background: #28a745; }
+            #micBtn { background: #17a2b8; width: 150px; user-select: none;}
+            #connectBtn { background: #007bff; width: 100%; margin-bottom: 15px; padding: 15px; font-size: 16px;}
+        </style>
+    </head>
+    <body>
+        <h2>🏥 Mithra Hospital AI - Web Tester</h2>
+        <button id="connectBtn">Connect to AI (Turn on Volume & Allow Mic)</button>
+        <div id="chat"></div>
+        <div class="controls">
+            <button id="micBtn" disabled>🎤 Hold to Speak</button>
+            <input type="text" id="msgInput" placeholder="Type or speak..." disabled />
+            <button id="sendBtn" disabled>Send</button>
+        </div>
+
+        <script>
+            let ws;
+            let audioContext;
+            let nextPlayTime = 0;
+            
+            let globalMicStream = null;
+            let globalSource = null;
+            let globalProcessor = null;
+            let isRecording = false;
+
+            const chat = document.getElementById('chat');
+            const msgInput = document.getElementById('msgInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const connectBtn = document.getElementById('connectBtn');
+            const micBtn = document.getElementById('micBtn');
+
+            let lastSender = null;
+            let lastBubble = null;
+
+            function appendLog(text, sender) {
+                if (sender === 'ai' && lastSender === 'ai' && lastBubble) {
+                    lastBubble.innerText += " " + text;
+                } else {
+                    const div = document.createElement('div');
+                    div.className = 'msg ' + sender;
+                    div.innerText = text;
+                    chat.appendChild(div);
+                    lastBubble = div;
+                }
+                lastSender = sender;
+                chat.scrollTop = chat.scrollHeight;
+            }
+
+            connectBtn.onclick = async () => {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 8000});
+
+                try {
+                    globalMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    if (audioContext.state === 'suspended') await audioContext.resume();
+                    nextPlayTime = audioContext.currentTime;
+
+                    globalSource = audioContext.createMediaStreamSource(globalMicStream);
+                    globalProcessor = audioContext.createScriptProcessor(1024, 1, 1);
+                    
+                    globalProcessor.onaudioprocess = (e) => {
+                        if (!isRecording) return; 
+                        
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const pcm16 = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            let s = Math.max(-1, Math.min(1, inputData[i] * 2.5));
+                            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        const buffer = new Uint8Array(pcm16.buffer);
+                        
+                        // Optimized Base64 Conversion
+                        let binary = '';
+                        const chunkSize = 0x8000;
+                        for (let i = 0; i < buffer.length; i += chunkSize) {
+                            binary += String.fromCharCode.apply(null, buffer.subarray(i, i + chunkSize));
+                        }
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({event: "media", payload: window.btoa(binary)}));
+                        }
+                    };
+                    
+                    const zeroGain = audioContext.createGain();
+                    zeroGain.gain.value = 0;
+                    globalSource.connect(globalProcessor);
+                    globalProcessor.connect(zeroGain);
+                    zeroGain.connect(audioContext.destination);
+
+                } catch (err) {
+                    console.error("Mic access denied", err);
+                    alert("Microphone access is required to use Voice STT.");
+                    return; 
+                }
+
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/test-media`);
+
+                ws.onopen = () => {
+                    connectBtn.style.display = 'none';
+                    msgInput.disabled = false;
+                    sendBtn.disabled = false;
+                    micBtn.disabled = false;
+                    appendLog("Connected. The AI is greeting you...", "ai");
+                };
+
+                ws.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.event === "media") {
+                        playAudio(data.payload);
+                    } else if (data.event === "text") {
+                        appendLog(data.text, data.sender || "ai");
+                    } else if (data.event === "stop") {
+                        appendLog("Call ended.", "ai");
+                        msgInput.disabled = true;
+                        sendBtn.disabled = true;
+                        micBtn.disabled = true;
+                    }
+                };
+            };
+
+            sendBtn.onclick = () => {
+                if (msgInput.value.trim() && ws) {
+                    appendLog(msgInput.value, "user");
+                    ws.send(JSON.stringify({event: "text", text: msgInput.value}));
+                    msgInput.value = '';
+                }
+            };
+
+            msgInput.addEventListener("keypress", function(event) {
+                if (event.key === "Enter") {
+                    event.preventDefault();
+                    sendBtn.click();
+                }
+            });
+
+            micBtn.onmousedown = () => {
+                if (!globalMicStream || micBtn.disabled) return;
+                isRecording = true; 
+                micBtn.innerText = "🎙️ Listening...";
+                micBtn.style.background = "#dc3545"; 
+            };
+
+            const stopMic = () => {
+                if (isRecording) {
+                    isRecording = false; 
+                    micBtn.innerText = "🎤 Hold to Speak";
+                    micBtn.style.background = "#17a2b8";
+                    appendLog("🎤 (Spoke via Microphone)", "user");
+
+                    // 👇 THE FIX: Blast 0.5s of absolute silence to force STT to finish the sentence instantly
+                    const silenceBuffer = new Uint8Array(8000); // 0.5 seconds of 8kHz 16-bit audio (all zeros)
+                    let binary = '';
+                    for (let i = 0; i < silenceBuffer.length; i++) binary += String.fromCharCode(silenceBuffer[i]);
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({event: "media", payload: window.btoa(binary)}));
+                    }
+                }
+            };
+
+            micBtn.onmouseup = stopMic;
+            micBtn.onmouseleave = stopMic;
+
+            function playAudio(base64String) {
+                const binaryString = window.atob(base64String);
+                const len = binaryString.length;
+                const bytes = new Int16Array(len / 2);
+                for (let i = 0; i < len; i += 2) {
+                    let int16 = (binaryString.charCodeAt(i)) | (binaryString.charCodeAt(i + 1) << 8);
+                    if (int16 & 0x8000) int16 = int16 | 0xFFFF0000;
+                    bytes[i / 2] = int16;
+                }
+
+                const floatArray = new Float32Array(bytes.length);
+                for (let i = 0; i < bytes.length; i++) {
+                    floatArray[i] = bytes[i] / 32768.0;
+                }
+
+                const buffer = audioContext.createBuffer(1, floatArray.length, 8000);
+                buffer.getChannelData(0).set(floatArray);
+
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+
+                if (nextPlayTime < audioContext.currentTime) {
+                    nextPlayTime = audioContext.currentTime;
+                }
+                source.start(nextPlayTime);
+                nextPlayTime += buffer.duration;
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@router.websocket("/test-media")
+async def test_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    call_sid = f"web_test_{int(time.time())}"
+    caller_number = "9999999999"  
+    logger.info(f"🧪 Web Test Stream started | callSid={call_sid} | Mock Caller={caller_number}")
+
+    serializer = WebTestSerializer()
+    
+    # 👇 FIX: Completely removed VAD injection here to stop dropping audio packets
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            serializer=serializer
+        )
+    )
+    
+    try:
+        await run_bot(transport, call_sid=call_sid, caller_number=caller_number)
+    except Exception as e:
+        logger.error(f"❌ Web Test WebSocket error: {e}")
 # # call_agent.py
 # # call_agent.py
 # import os

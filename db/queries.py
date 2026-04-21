@@ -182,17 +182,32 @@ async def book_new_appointment(pool, clinic_id, doctor_id, patient_name, phone, 
             if await conn.fetchval(check_user_query, doctor_id, resolved_patient_id, start_time):
                 return "ALREADY_BOOKED_BY_USER", None, is_slots_needed
                 
-            capacity_query = "SELECT max_appointments_per_slot FROM slots_for_token_system WHERE doctor_id = $1::uuid AND start_time = $2::time AND status = 'open' AND deleted_at IS NULL"
-            max_capacity = await conn.fetchval(capacity_query, doctor_id, start_time.time())
+            # Check max capacity for this specific shift
+            capacity_query = "SELECT max_appointments_per_slot FROM slots_for_token_system WHERE doctor_id = $1::uuid AND start_time = ($2 AT TIME ZONE 'Asia/Kolkata')::time AND status = 'open' AND deleted_at IS NULL"
+            max_capacity = await conn.fetchval(capacity_query, doctor_id, start_time)
             if not max_capacity: return "SLOT_TAKEN", None, is_slots_needed
 
-            count_query = "SELECT COUNT(id) FROM appointments WHERE doctor_id = $1::uuid AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata') AND appointment_start::time = $2::time AND deleted_at IS NULL AND status IN ('confirmed', 'pending')"
+            # 👇 FIXED: Count current bookings for this exact Date AND Time Shift
+            count_query = """
+                SELECT COUNT(id) FROM appointments 
+                WHERE doctor_id = $1::uuid 
+                  AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata') 
+                  AND (appointment_start AT TIME ZONE 'Asia/Kolkata')::time = ($2 AT TIME ZONE 'Asia/Kolkata')::time 
+                  AND deleted_at IS NULL AND status IN ('confirmed', 'pending')
+            """
             if await conn.fetchval(count_query, doctor_id, start_time) >= max_capacity:
                 return "SLOT_TAKEN", None, is_slots_needed
             
-            # 👇 ONLY assign token right now if it's a free follow-up (confirmed)
+            # 👇 FIXED: Isolate token counter to this exact Date AND Time Shift
             if status == 'confirmed':
-                token_query = "SELECT COALESCE(MAX(token_number), 0) + 1 FROM appointments WHERE doctor_id = $1::uuid AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata') AND appointment_start::time = $2::time AND deleted_at IS NULL AND token_number IS NOT NULL"
+                token_query = """
+                    SELECT COALESCE(MAX(token_number), 0) + 1 
+                    FROM appointments 
+                    WHERE doctor_id = $1::uuid 
+                      AND DATE(appointment_start AT TIME ZONE 'Asia/Kolkata') = DATE($2 AT TIME ZONE 'Asia/Kolkata') 
+                      AND (appointment_start AT TIME ZONE 'Asia/Kolkata')::time = ($2 AT TIME ZONE 'Asia/Kolkata')::time 
+                      AND deleted_at IS NULL AND token_number IS NOT NULL
+                """
                 token_number = await conn.fetchval(token_query, doctor_id, start_time)
 
         insert_query = """
@@ -201,5 +216,4 @@ async def book_new_appointment(pool, clinic_id, doctor_id, patient_name, phone, 
         """
         appt_id = await conn.fetchval(insert_query, clinic_id, resolved_patient_id, doctor_id, start_time, end_time, status, reason, payment_status, payment_amount, token_number)
         
-        # We now return 3 values!
         return appt_id, token_number, is_slots_needed
