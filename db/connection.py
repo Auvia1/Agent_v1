@@ -31,7 +31,6 @@
 #         logger.error(f"❌ Failed to connect to database: {e}")
 #         raise
 
-
 import os
 import asyncpg
 from loguru import logger
@@ -50,18 +49,16 @@ async def get_db_pool():
 
         _pool = await asyncpg.create_pool(
             dsn=database_url,
-            statement_cache_size=0,   # good for poolers
-            ssl="require",            # important for Supabase
+            statement_cache_size=0,
+            ssl="require",
             min_size=1,
             max_size=5,
-            timeout=30,
-            command_timeout=30
+            timeout=60,
+            command_timeout=60
         )
 
         logger.info("✅ Database pool created successfully.")
-
         await cleanup_expired_pending_appointments(_pool)
-
         return _pool
 
     except Exception as e:
