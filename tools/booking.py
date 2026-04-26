@@ -13,29 +13,51 @@ from tools.pool import get_pool
 from db.queries import get_or_create_patient, book_new_appointment
 from tools.payment import generate_payment_link
 from tools.notify import send_confirmation
+from tools.activity_logger import log_appointment_cancelled
  
  
 async def cancel_unpaid_appointment(appointment_id: str):
     """Background task to cancel appointments and payments if not paid within 15 minutes."""
     logger.info(f"⏳ Timer started: Checking if {appointment_id} is paid in 15 minutes...")
     await asyncio.sleep(900) # 15 minutes
-    
+
     pool = get_pool()  # ✅ reuse singleton, no new pool
     try:
         async with pool.acquire() as conn:
             # 1. Try to cancel the appointment IF it is still pending/unpaid
             # We use RETURNING id to know if it actually updated (meaning it wasn't paid)
             cancel_query = """
-                UPDATE appointments 
-                SET status = 'cancelled', updated_at = NOW() 
+                UPDATE appointments
+                SET status = 'cancelled', updated_at = NOW()
                 WHERE id = $1::uuid AND status = 'pending' AND payment_status = 'unpaid'
                 RETURNING id
             """
             cancelled_id = await conn.fetchval(cancel_query, appointment_id)
-            
+
             # 2. If it was cancelled (meaning it wasn't paid in time), mark payment as 'failed'
             if cancelled_id:
                 logger.warning(f"⏳ 15 mins passed. Cancelling unpaid appointment {appointment_id}")
+
+                # Fetch appointment details for logging
+                appt_info = await conn.fetchrow("""
+                    SELECT a.clinic_id, p.name as patient_name, d.name as doctor_name
+                    FROM appointments a
+                    JOIN patients p ON a.patient_id = p.id
+                    JOIN doctors d ON a.doctor_id = d.id
+                    WHERE a.id = $1::uuid
+                """, appointment_id)
+
+                # Log the cancellation
+                if appt_info:
+                    await log_appointment_cancelled(
+                        conn,
+                        clinic_id=str(appt_info['clinic_id']),
+                        appointment_id=appointment_id,
+                        patient_name=appt_info['patient_name'],
+                        doctor_name=appt_info['doctor_name'],
+                        reason="Unpaid after 15 minutes"
+                    )
+
                 await conn.execute(
                     "UPDATE payments SET status = 'failed' WHERE appointment_id = $1::uuid",
                     appointment_id
@@ -43,7 +65,7 @@ async def cancel_unpaid_appointment(appointment_id: str):
                 logger.info(f"🛑 Payment ledger marked as 'failed' for {appointment_id}")
             else:
                 logger.info(f"✅ 15 min check: Appointment {appointment_id} was already paid or handled.")
-                
+
     except Exception as e:
         logger.error(f"❌ Error cancelling unpaid appointment: {e}")
  

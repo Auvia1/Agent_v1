@@ -163,6 +163,7 @@ import os
 import pytz
 from loguru import logger
 from tools.pool import get_pool  # ✅ fixed — was broken `from db.connection import`
+from tools.activity_logger import log_payment_received
 
 
 def _format_whatsapp_number(phone_number: str) -> str:
@@ -308,11 +309,30 @@ async def handle_successful_payment(appointment_id: str):
 
             # 4. Fetch the final data for the WhatsApp Receipt
             query = """
-                SELECT p.name as patient_name, p.phone, d.name as doctor_name, a.reason, a.appointment_start, a.token_number
+                SELECT p.name as patient_name, p.phone, d.name as doctor_name, a.reason, a.appointment_start, a.token_number, a.clinic_id, a.payment_amount
                 FROM appointments a JOIN patients p ON a.patient_id = p.id JOIN doctors d ON a.doctor_id = d.id
                 WHERE a.id = $1::uuid
             """
             record = await conn.fetchrow(query, appointment_id)
+
+            # Log payment received activity
+            if record:
+                # Fetch payment_id to log with the activity
+                payment_record = await conn.fetchrow(
+                    "SELECT id FROM payments WHERE appointment_id = $1::uuid LIMIT 1",
+                    appointment_id
+                )
+                if payment_record:
+                    await log_payment_received(
+                        conn,
+                        clinic_id=str(record['clinic_id']),
+                        payment_id=str(payment_record['id']),
+                        appointment_id=appointment_id,
+                        amount=float(record['payment_amount']),
+                        currency="INR",
+                        payment_method="razorpay",
+                        patient_name=record['patient_name']
+                    )
 
             if record:
                 ist = pytz.timezone('Asia/Kolkata')

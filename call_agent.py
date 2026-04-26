@@ -48,6 +48,7 @@ from pipecat.services.google.llm import GoogleLLMService
 
 from tools.pipecat_tools import register_all_tools, get_tools_schema
 from tools.notify import handle_successful_payment
+from tools.activity_logger import log_call_logged
 from tools.pool import get_pool
 
 load_dotenv(override=True)
@@ -394,10 +395,14 @@ async def save_call_log(call_sid: str, caller_number: str, duration: float, mess
         async with pool.acquire() as conn:
             clinic_id = await conn.fetchval("SELECT id FROM clinics LIMIT 1")
             if not clinic_id: return
-            await conn.execute("""
+            call_id = await conn.fetchval("""
                 INSERT INTO calls (clinic_id, type, caller, agent_type, duration, ai_summary)
                 VALUES ($1, 'incoming', $2, 'ai', $3, $4)
+                RETURNING id
             """, clinic_id, caller_number, int(duration), ai_summary)
+
+            # Log activity for call
+            await log_call_logged(conn, str(clinic_id), str(call_id), caller_number, int(duration), ai_summary)
         logger.info(f"✅ Call Log Saved | Summary: {ai_summary}")
     except Exception as e:
         logger.error(f"❌ Failed to save call log: {e}", exc_info=True)

@@ -1,5 +1,6 @@
 #db/queries.py
 from loguru import logger
+from tools.activity_logger import log_appointment_created, log_patient_created
 
 async def cleanup_expired_pending_appointments(pool):
     """Sweeps the DB for pending, unpaid appointments older than 15 minutes and cancels them."""
@@ -46,6 +47,10 @@ async def get_or_create_patient(conn, clinic_id: str, patient_name: str, phone: 
     try:
         new_id = await conn.fetchval(insert_query, clinic_id, clean_name, clean_phone)
         logger.info(f"🆕 Created NEW patient profile: {clean_name} ({clean_phone})")
+
+        # Log activity for new patient creation
+        await log_patient_created(conn, clinic_id, str(new_id), clean_name, clean_phone)
+
         return str(new_id)
     except Exception as e:
         # Ultimate fallback just in case the SQL command wasn't run
@@ -215,5 +220,27 @@ async def book_new_appointment(pool, clinic_id, doctor_id, patient_name, phone, 
             VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::appointment_status, $7, $8, $9, $10) RETURNING id
         """
         appt_id = await conn.fetchval(insert_query, clinic_id, resolved_patient_id, doctor_id, start_time, end_time, status, reason, payment_status, payment_amount, token_number)
-        
+
+        # Log activity for appointment creation - fetch doctor and patient names
+        try:
+            doctor_info = await conn.fetchrow("SELECT name FROM doctors WHERE id = $1::uuid", doctor_id)
+            patient_info = await conn.fetchrow("SELECT name FROM patients WHERE id = $1::uuid", resolved_patient_id)
+
+            doctor_name = doctor_info['name'] if doctor_info else "Unknown Doctor"
+            patient_name_db = patient_info['name'] if patient_info else patient_name
+
+            await log_appointment_created(
+                conn,
+                clinic_id=clinic_id,
+                appointment_id=str(appt_id),
+                patient_name=patient_name_db,
+                doctor_name=doctor_name,
+                appointment_time=start_time.isoformat(),
+                reason=reason,
+                appointment_type="free_followup" if is_followup else "consultation",
+                payment_status=payment_status,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to log appointment creation: {e}")
+
         return appt_id, token_number, is_slots_needed

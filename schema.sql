@@ -252,16 +252,33 @@ CREATE TABLE activity_log (
   clinic_id   UUID NOT NULL REFERENCES clinics(id) ON DELETE CASCADE,
   event_type  VARCHAR(50) NOT NULL CHECK (char_length(TRIM(event_type)) > 0),
   title       TEXT NOT NULL CHECK (char_length(TRIM(title)) > 0),
-  entity_type VARCHAR(50),   
-  entity_id   UUID,          
-  user_id     UUID,          
-  meta        JSONB,         
+  entity_type VARCHAR(50),
+  entity_id   UUID,
+  user_id     UUID,
+  meta        JSONB,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_activity_log_clinic_id  ON activity_log(clinic_id);
 CREATE INDEX idx_activity_log_created_at ON activity_log(created_at DESC);
 CREATE INDEX idx_activity_log_entity     ON activity_log(entity_type, entity_id);
+
+---
+
+-- ☎️ 11. calls (for tracking incoming calls)
+CREATE TABLE IF NOT EXISTS calls (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  clinic_id     UUID NOT NULL REFERENCES clinics(id) ON DELETE CASCADE,
+  type          VARCHAR(50) NOT NULL DEFAULT 'incoming',
+  caller        VARCHAR(20),
+  agent_type    VARCHAR(50) DEFAULT 'ai',
+  duration      INTEGER DEFAULT 0,
+  ai_summary    TEXT,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_calls_clinic_id   ON calls(clinic_id);
+CREATE INDEX idx_calls_created_at  ON calls(created_at DESC);
 
 
 //new statement
