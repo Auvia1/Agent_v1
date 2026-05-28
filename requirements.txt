@@ -17,3 +17,4 @@ sarvamai
 torch
 torchaudio
 uvicorn==0.34.3
+google-cloud-speech
