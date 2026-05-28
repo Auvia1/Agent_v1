@@ -418,7 +418,7 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         context_aggregator.assistant()
     ])
 
-    task_pipeline = PipelineTask(pipeline, params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000))
+    task_pipeline = PipelineTask(pipeline, params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000))
 
     async def trigger_greeting():
         await asyncio.sleep(0.2)
