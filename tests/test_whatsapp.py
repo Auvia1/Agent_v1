@@ -1,43 +1,47 @@
-"""
-Quick test: sends a WhatsApp message via Meta Cloud API.
-Run from project root:  python3 tests/test_whatsapp.py
-"""
-import asyncio
-import sys
+#tests/test_whatsapp.py
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
+import requests
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
-from tools.notify import send_confirmation
+ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 
-TEST_PHONE = "8309833107"   # change if needed
+# MUST include country code (e.g., 91 for India)
+TEST_PHONE = "918309833107" 
 
-async def main():
-    print(f"Sending test WhatsApp to {TEST_PHONE} ...")
+def test_hello_world():
+    print(f"Sending hello_world template to {TEST_PHONE}...")
     
-    # Dummy data simulating what the database would return
-    patient_name = "Hari Ram"
-    phone = TEST_PHONE
-    doctor_name = "Dr. Rohan Sharma"
-    reason = "Fever and cough"
-    appt_time = "March 23, 2026 at 01:00 PM"
+    url = f"https://graph.facebook.com/v19.0/{PHONE_ID}/messages"
     
-    # The exact template from tools/notify.py -> handle_successful_payment
-    whatsapp_msg = (
-        "✅ *Booking Confirmed!*\n\n"
-        f"👤 *Name:* {patient_name}\n"
-        f"📱 *Phone:* {phone}\n"
-        f"👨‍⚕️ *Doctor:* {doctor_name}\n"
-        f"🩺 *Reason:* {reason}\n"
-        f"📅 *Time:* {appt_time}\n\n"
-        "Thank you for choosing Mithra Hospitals!"
-    )
-
-    result = await send_confirmation(TEST_PHONE, whatsapp_msg)
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
     
-    print("Result:", "SUCCESS" if result else "FAILED")
+    # The required payload structure for a template without variables
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": TEST_PHONE,
+        "type": "template",
+        "template": {
+            "name": "hello_world",
+            "language": {
+                "code": "en_US"
+            }
+        }
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    
+    print("\nStatus Code:", response.status_code)
+    if response.status_code == 200:
+        print("✅ SUCCESS! Check your WhatsApp.")
+    else:
+        print("❌ FAILED!")
+        print("Error Details:", response.json())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    test_hello_world()
