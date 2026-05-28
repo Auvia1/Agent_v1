@@ -210,7 +210,7 @@ class AutoLanguageProcessor(FrameProcessor):
                         delta=TTSSettings(
                             language=target_locale,
                             voice=target_voice_id,
-                            speaking_rate=1.5 if target_locale == "te-IN" else 0.95
+                            speaking_rate=2 if target_locale == "te-IN" else 0.95
                         )
                     ),
                     direction
