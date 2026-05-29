@@ -151,7 +151,7 @@ PHASE 5 (Confirmation & Persistence):
 ONLY AFTER the tool returns "success", inform the patient.
 - For a paid appointment, say EXACTLY the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
 - CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
-- CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST first say a polite thank you and goodbye in your active language, and THEN call `end_call`.
+- CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST say thanks for using our service in your active language, and THEN call `end_call`.
 """
 
 # ==========================================================
@@ -687,7 +687,7 @@ async def razorpay_webhook(request: Request):
 # ONLY AFTER the tool returns "success", inform the patient.
 # - For a paid appointment, say EXACTLY the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
 # - CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
-# - CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST first say a polite thank you and goodbye in your active language, and THEN call `end_call`.
+# - CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST first say thanks for using our service in your active language, and THEN call `end_call`.
 # """
 
 # # ==========================================================
