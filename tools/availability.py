@@ -106,8 +106,6 @@
 #                         return 
                     
 #     await params.result_callback({"status": "error", "message": "No slots/sessions available for the next 14 days."})
-
-# tools/availability.py
 import pytz
 import datetime
 import difflib
@@ -128,28 +126,33 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
     today_date = now.date()
 
     target_date = None
+    days_to_check = [0, 1]  # Default: Check today and tomorrow
+
     if requested_date:
         try: 
             target_date = date_parser.parse(requested_date).date()
+            delta_days = (target_date - today_date).days
+            
+            # 🟢 48-HOUR GATEKEEPER: Instantly block dates beyond tomorrow!
+            if delta_days < 0 or delta_days > 1:
+                logger.warning(f"📅 Requested date {target_date} is out of bounds.")
+                return await params.result_callback({
+                    "status": "error", 
+                    "message": "SYSTEM DIRECTIVE: Inform the user gracefully that we only accept advance bookings for TODAY and TOMORROW. Ask them if they would like to check availability for one of those two days instead."
+                })
+                
+            # If valid (today or tomorrow), only loop for that specific day
+            days_to_check = [delta_days]
         except Exception as e:
+            logger.error(f"Error parsing date: {e}")
             pass
 
-    # 🟢 CRITICAL BOUNDS GATEKEEPER
-    days_offset = [0, 1] # Default: check today and tomorrow
-    if target_date:
-        delta_days = (target_date - today_date).days
-        if delta_days < 0 or delta_days > 1:
-            logger.warning(f"📅 Requested date {target_date} is out of bounds.")
-            return await params.result_callback({
-                "status": "error", 
-                "message": "SYSTEM DIRECTIVE: Inform the user gracefully that you can only check availability and book appointments for TODAY and TOMORROW. Ask them which of these two days they prefer."
-            })
-        days_offset = [delta_days] # Only check the specific requested day
-
     async with pool.acquire() as conn:
+        # 1. Determine Clinic Mode
         settings = await conn.fetchrow("SELECT is_slots_needed FROM clinic_settings WHERE clinic_id = $1::uuid", clinic_id)
         is_slots_needed = settings['is_slots_needed'] if settings else False
 
+        # 2. Fetch doctors for Fuzzy Matching
         all_doctors_query = "SELECT id, name, speciality FROM doctors WHERE clinic_id = $1::uuid AND is_active = TRUE AND deleted_at IS NULL"
         all_doctors = await conn.fetch(all_doctors_query, clinic_id)
 
@@ -157,7 +160,7 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
         highest_similarity = 0.0
         search_term = problem_or_speciality.lower().replace("dr.", "").replace("dr", "").strip()
 
-        # 🧠 Enhanced Fuzzy Match (Checks both Speciality AND Name)
+        # Fuzzy Match Logic
         for doc in all_doctors:
             db_doc_name = doc['name'].lower().replace("dr.", "").replace("dr", "").strip()
             db_spec = (doc['speciality'] or "").lower()
@@ -169,7 +172,7 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                     highest_similarity = name_sim
                     matched_doctor = doc
                     
-            # Check Speciality (Handles Gynecologist vs Gynaecologist)
+            # Check Speciality
             spec_sim = difflib.SequenceMatcher(None, db_spec, search_term).ratio()
             if spec_sim > 0.60 or search_term in db_spec or db_spec in search_term:
                 if spec_sim > highest_similarity:
@@ -188,10 +191,21 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
         doc_name = matched_doctor['name']
         doc_spec = matched_doctor['speciality']
 
+        # 3. Fetch schedules for the matched doctor
         if is_slots_needed:
-            sched_query = "SELECT day_of_week, start_time, end_time, slot_duration_minutes FROM doctor_schedule WHERE doctor_id = $1::uuid AND effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)"
+            sched_query = """
+                SELECT day_of_week, start_time, end_time, slot_duration_minutes
+                FROM doctor_schedule
+                WHERE doctor_id = $1::uuid
+                  AND effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+            """
         else:
-            sched_query = "SELECT day_of_week, start_time, end_time, max_appointments_per_slot FROM slots_for_token_system WHERE doctor_id = $1::uuid AND status = 'open' AND effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)"
+            sched_query = """
+                SELECT day_of_week, start_time, end_time, max_appointments_per_slot
+                FROM slots_for_token_system
+                WHERE doctor_id = $1::uuid AND status = 'open'
+                  AND effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+            """
 
         records = await conn.fetch(sched_query, doc_id)
         doc_schedules = {}
@@ -201,12 +215,12 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                 doc_schedules[dow] = []
             doc_schedules[dow].append((r['start_time'], r['end_time'], r[3]))
 
-        # Loop through the valid days (0=today, 1=tomorrow)
+        # 4. Check target day window for availability
         available_slots = []
         valid_sessions = []
         checked_date_obj = None
 
-        for offset in days_offset:
+        for offset in days_to_check:
             check_dt = now + datetime.timedelta(days=offset)
             check_date_obj = check_dt.date()
             checked_date_obj = check_date_obj
@@ -224,7 +238,8 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                     shift_start_dt = datetime.datetime.combine(check_date_obj, start_time)
                     shift_end_dt = datetime.datetime.combine(check_date_obj, end_time)
 
-                    if any(off["off_start"] <= shift_start_dt and off["off_end"] >= shift_end_dt for off in time_offs):
+                    is_shift_blocked = any(off["off_start"] <= shift_start_dt and off["off_end"] >= shift_end_dt for off in time_offs)
+                    if is_shift_blocked:
                         continue
 
                     if check_date_obj == today_date and shift_end_dt.time() <= now.time():

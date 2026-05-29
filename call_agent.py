@@ -51,6 +51,7 @@ from pipecat.services.google.llm import GoogleLLMService
 from tools.pipecat_tools import register_all_tools, get_tools_schema
 from tools.notify import handle_successful_payment
 from tools.pool import get_pool
+from db.queries import get_clinic_id
 
 load_dotenv(override=True)
 
@@ -74,21 +75,23 @@ async def ensure_redis_client():
         redis_conn_obj = None
 
 # ==========================================================
-# 🧠 SYSTEM PROMPT
+# 🧠 SYSTEM PROMPT GENERATOR (DYNAMIC)
 # ==========================================================
-ist_zone = pytz.timezone('Asia/Kolkata')
-live_time_str = datetime.now(ist_zone).strftime('%A, %B %d, %Y at %I:%M %p IST')
+def generate_system_prompt(specialties_list: str) -> str:
+    ist_zone = pytz.timezone('Asia/Kolkata')
+    live_time_str = datetime.now(ist_zone).strftime('%A, %B %d, %Y at %I:%M %p IST')
 
-# ==========================================================
-# 🧠 SYSTEM PROMPT
-# ==========================================================
-ist_zone = pytz.timezone('Asia/Kolkata')
-live_time_str = datetime.now(ist_zone).strftime('%A, %B %d, %Y at %I:%M %p IST')
-
-VOICE_SYSTEM_PROMPT = f"""Role: Your name is Anjali, the AI Receptionist for Mithra Medicare Hospitals Bhimavaram.
+    return f"""Role: Your name is Anjali, the AI Receptionist for Mithra Medicare Hospitals Bhimavaram.
 CURRENT LIVE TIME: {live_time_str}
 
 You transition strictly through phases. NEVER backtrack.
+
+--- 🏥 HOSPITAL SPECIALTIES (CRITICAL) ---
+We currently have the following departments/specialists available at our clinic:
+[{specialties_list}]
+
+You MUST internally map the user's symptoms to the most relevant specialty from this list before calling `check_availability`. 
+Do NOT default to General Physician if the user's symptoms clearly match another specialist on this list.
 
 --- 🌐 LANGUAGE & TRANSLATION RULES (CRITICAL) ---
 1. STARTING LANGUAGE: You start the conversation in Telugu.
@@ -129,7 +132,7 @@ PHASE 2 (Offer & Negotiation):
 - Ask the user *which specific session/time* they prefer. DO NOT just ask a yes/no question. Once they choose a specific session, immediately move to PHASE 3.
 
 PHASE 3 (Details Request - ANTI-HALLUCINATION STRICT):
-- If the user agrees to a slot, ask EXACTLY: "Could you please tell me the patient's name and WhatsApp number?"
+- If the user agrees to a slot, ask EXACTLY: "Could you please tell me the patient's name and WhatsApp number?" (You MUST say WhatsApp, do not say phone).
 - NO WHATSAPP EXCEPTION (CRITICAL): If the user states they DO NOT have WhatsApp, DO NOT book the appointment. Tell them the doctor's available timings, advise them to visit the hospital directly during those timings, and explain that online booking isn't possible without a WhatsApp number. Do not call the booking tool. Ask if they need any other help.
 - ZERO-LEAKAGE RULE: You are STRICTLY FORBIDDEN from using any name, phone number, or data from previous calls or "default" values. 
 
@@ -150,6 +153,7 @@ ONLY AFTER the tool returns "success", inform the patient.
 - CRITICAL: After the confirmation, DO NOT end the call. Ask: "Is there anything else I can help you with today?"
 - CLOSING THE CALL: If the user says they are done, have no more questions, or say goodbye, you MUST first say a polite thank you and goodbye in your active language, and THEN call `end_call`.
 """
+
 # ==========================================================
 # 🛠️ PROCESSORS & SERIALIZERS
 # ==========================================================
@@ -211,7 +215,6 @@ class AutoLanguageProcessor(FrameProcessor):
                 logger.info(f"[{self.session_identifier}] 🌐 Switching to: {target_locale} | Voice: {target_voice_id}")
                 self.active_locale = target_locale
 
-                # ✅ FIXED: Now uses Sarvam Settings and 'pace' instead of 'speaking_rate'
                 await self.push_frame(
                     TTSUpdateSettingsFrame(
                         settings=SarvamTTSService.Settings(
@@ -353,6 +356,25 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     await ensure_redis_client()
     short_session_id = session_call_uuid[:8]
 
+    # --- 0. DYNAMIC CLINIC CONTEXT SETUP ---
+    db_pool = get_pool()
+    specialties_text = "General Physician" # Safe fallback
+    try:
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                clinic_id = await get_clinic_id(db_pool)
+                if clinic_id:
+                    records = await conn.fetch("SELECT DISTINCT speciality FROM doctors WHERE clinic_id = $1::uuid AND is_active = TRUE AND deleted_at IS NULL", clinic_id)
+                    specialties = [r['speciality'] for r in records if r['speciality']]
+                    if specialties:
+                        specialties_text = ", ".join(specialties)
+                        logger.info(f"[{short_session_id}] 🏥 Dynamically loaded specialties: {specialties_text}")
+    except Exception as e:
+        logger.warning(f"[{short_session_id}] ⚠️ Could not fetch specialties for prompt: {e}")
+
+    # Inject the fetched specialties into the prompt
+    system_prompt_text = generate_system_prompt(specialties_text)
+
     # --- 1. Generate LiveKit Access Token ---
     livekit_url = os.getenv("LIVEKIT_URL")
     api_key = os.getenv("LIVEKIT_API_KEY")
@@ -384,8 +406,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
             vad_analyzer=custom_vad 
         )
     )
-
-    # --- 3. Initialize Services ---
     
     # --- 3. Initialize Services ---
     stt_service = SarvamSTTService(
@@ -412,7 +432,7 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
 
     register_all_tools(llm_service)
 
-    sys_context = LLMContext(messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}], tools=get_tools_schema())
+    sys_context = LLMContext(messages=[{"role": "system", "content": system_prompt_text}], tools=get_tools_schema())
 
     context_aggregator = LLMContextAggregatorPair(sys_context)
 
@@ -438,7 +458,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     async def trigger_greeting():
         await asyncio.sleep(0.2)
         logger.info(f"[{short_session_id}] 🗣️ Triggering initial Anjali greeting...")
-        # 👇 Updated Greeting!
         anjali_greeting = "నమస్కారం! నేను అంజలి, మిత్ర మెడికేర్ హాస్పిటల్స్ భీమవరం నుండి మాట్లాడుతున్నాను. నేను మీకు ఎలా సహాయపడగలను?"
         await task_pipeline.queue_frames([TTSSpeakFrame(anjali_greeting, append_to_context=True)])
 
