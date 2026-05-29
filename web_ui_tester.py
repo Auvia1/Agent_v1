@@ -21,22 +21,25 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.google.tts import GoogleTTSService
+from pipecat.ext.sarvam.stt import SarvamSTTService
+from pipecat.ext.sarvam.tts import SarvamTTSService
 from pipecat.services.google.llm import GoogleLLMService
 
 from tools.pipecat_tools import register_all_tools, get_tools_schema
 
-# Re-use the existing logic from your call agent
+# 👈 IMPORT UPDATED: Replaced VOICE_SYSTEM_PROMPT with generate_system_prompt
 from call_agent import (
     ensure_redis_client,
-    VOICE_SYSTEM_PROMPT,
+    generate_system_prompt, 
     STTTextCleanerProcessor,
     AutoLanguageProcessor,
     BillingTracker,
     PipecatBugFixProcessor,
     save_call_log
 )
+# 👈 NEW IMPORTS for dynamic prompt
+from tools.pool import get_pool
+from db.queries import get_clinic_id
 
 router = APIRouter()
 
@@ -56,16 +59,13 @@ class EnhancedUITracker(FrameProcessor):
             return
 
         try:
-            # 1. Track User Speech (STT)
             if self.role == "user" and direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame):
                 await self.frontend_ws.send_text(json.dumps({"event": "text", "text": frame.text, "sender": "user"}))
             
-            # 2. Track AI Output and Function/Tool Executions
             elif self.role == "ai":
                 if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TextFrame):
                     await self.frontend_ws.send_text(json.dumps({"event": "text", "text": frame.text, "sender": "ai"}))
                 
-                # When LLM decides to call a tool
                 elif isinstance(frame, FunctionCallInProgressFrame):
                     await self.frontend_ws.send_text(json.dumps({
                         "event": "function_call",
@@ -73,7 +73,6 @@ class EnhancedUITracker(FrameProcessor):
                         "args": frame.arguments
                     }))
                     
-                # When the Tool returns the database success/failure result
                 elif isinstance(frame, FunctionCallResultFrame):
                     result_data = getattr(frame, "result", getattr(frame, "tool_return", {}))
                     await self.frontend_ws.send_text(json.dumps({
@@ -92,7 +91,24 @@ class EnhancedUITracker(FrameProcessor):
 async def run_local_test_bot(websocket: WebSocket, session_call_uuid: str):
     await ensure_redis_client()
     short_session_id = session_call_uuid[:8]
-    gcp_credentials_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    # --- 0. DYNAMIC CLINIC CONTEXT SETUP ---
+    db_pool = get_pool()
+    specialties_text = "General Physician" # Safe fallback
+    try:
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                clinic_id = await get_clinic_id(db_pool)
+                if clinic_id:
+                    records = await conn.fetch("SELECT DISTINCT speciality FROM doctors WHERE clinic_id = $1::uuid AND is_active = TRUE AND deleted_at IS NULL", clinic_id)
+                    specialties = [r['speciality'] for r in records if r['speciality']]
+                    if specialties:
+                        specialties_text = ", ".join(specialties)
+                        logger.info(f"[{short_session_id}] 🏥 Dynamically loaded specialties: {specialties_text}")
+    except Exception as e:
+        logger.warning(f"[{short_session_id}] ⚠️ Could not fetch specialties for prompt: {e}")
+
+    system_prompt_text = generate_system_prompt(specialties_text)
 
     # Local UI Transport
     active_transport = FastAPIWebsocketTransport(
@@ -106,13 +122,32 @@ async def run_local_test_bot(websocket: WebSocket, session_call_uuid: str):
         )
     )
 
-    stt_service = SarvamSTTService(api_key=os.getenv("SARVAM_API_KEY"), language="unknown", model="saaras:v3", mode="transcribe")
-    tts_service = GoogleTTSService(credentials_path=gcp_credentials_file, voice="te-IN-Chirp3-HD-Despina", language="te-IN")
+    stt_service = SarvamSTTService(
+        api_key=os.getenv("SARVAM_API_KEY"), 
+        mode="transcribe",
+        settings=SarvamSTTService.Settings(
+            model="saaras:v3",
+            language="unknown"
+        )
+    )
+    
+    tts_service = SarvamTTSService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        sample_rate=8000,
+        settings=SarvamTTSService.Settings(
+            model="bulbul:v3",
+            voice="priya",
+            language="te-IN",
+            pace=1.1
+        )
+    )
+    
     llm_service = GoogleLLMService(api_key=os.getenv("GEMINI_API_KEY"), model="gemini-2.5-flash")
 
     register_all_tools(llm_service)
 
-    sys_context = LLMContext(messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}], tools=get_tools_schema())
+    # Inject dynamic prompt
+    sys_context = LLMContext(messages=[{"role": "system", "content": system_prompt_text}], tools=get_tools_schema())
     context_aggregator = LLMContextAggregatorPair(sys_context)
     bill_tracker = BillingTracker(sys_context, short_session_id)
 
@@ -120,10 +155,10 @@ async def run_local_test_bot(websocket: WebSocket, session_call_uuid: str):
         active_transport.input(),
         stt_service,
         STTTextCleanerProcessor(short_session_id),
-        EnhancedUITracker(websocket, "user"), # <--- Catches User STT
+        EnhancedUITracker(websocket, "user"), 
         context_aggregator.user(),
         llm_service,
-        EnhancedUITracker(websocket, "ai"),   # <--- Catches LLM Text & Functions
+        EnhancedUITracker(websocket, "ai"),   
         bill_tracker,
         AutoLanguageProcessor(short_session_id),
         tts_service,
