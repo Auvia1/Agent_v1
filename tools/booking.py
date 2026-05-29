@@ -7,6 +7,7 @@ from loguru import logger
 import redis.asyncio as redis
 from pipecat.services.llm_service import FunctionCallParams
 import difflib
+import aiohttp
 
 from tools.pool import get_pool
 from db.queries import get_or_create_patient, book_new_appointment
@@ -41,6 +42,31 @@ async def cancel_unpaid_appointment(appointment_id: str):
                 
     except Exception as e:
         logger.error(f"❌ Error cancelling unpaid appointment: {e}")
+
+async def notify_live_activity(clinic_id: str, appointment_id: str, patient_name: str, appt_time: str):
+    """Sends a POST request to the backend's live activity WebSocket broadcaster."""
+    try:
+        backend_url = os.getenv("BACKEND_API_URL", "http://localhost:4002")
+        payload = {
+            "clinic_id": str(clinic_id),
+            "event_type": "APPOINTMENT_BOOKED",
+            "title": f"AI booked an appointment for {patient_name}",
+            "entity_type": "appointment",
+            "entity_id": str(appointment_id),
+            "meta": {
+                "patient_name": patient_name,
+                "channel": "voice_bot",
+                "time": appt_time
+            }
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{backend_url}/api/activity", json=payload, timeout=2.0) as resp:
+                if resp.status == 200:
+                    logger.info(f"📡 Broadcasted Live Activity for {patient_name}")
+                else:
+                    logger.warning(f"⚠️ Failed to broadcast Live Activity: {resp.status}")
+    except Exception as e:
+        logger.warning(f"⚠️ Error broadcasting Live Activity: {e}")
 
 async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: bool = False, is_same_patient: str = "unknown", existing_patient_id: str = None):
     """Internal helper that performs the actual database insertion, Redis locking, and Meta notifications."""
@@ -93,6 +119,11 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         ist = pytz.timezone('Asia/Kolkata')
         appt_time_str = start_dt.astimezone(ist).strftime('%I:%M %p')
         appt_date_str = start_dt.astimezone(ist).strftime('%B %d')
+
+        # Broadcast live activity to the frontend WebSocket
+        asyncio.create_task(notify_live_activity(
+            clinic_id, str(appt_id), clean_name, appt_time_str
+        ))
 
         if is_followup:
             token_display = str(token_number) if token_number else "N/A"
