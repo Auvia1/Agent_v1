@@ -133,7 +133,7 @@ app = FastAPI(lifespan=lifespan)
 # 2. Attach the Train Cars (Your Agents & UI)
 app.include_router(whatsapp_agent.router)
 app.include_router(call_agent.router)
-app.include_router(web_ui_tester.router) # <--- ADDED: Attaches the /test-ui route to the server
+# app.include_router(web_ui_tester.router) # <--- ADDED: Attaches the /test-ui route to the server
 
 # 3. Razorpay Webhook
 @app.post("/razorpay-webhook")
