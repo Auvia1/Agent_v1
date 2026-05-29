@@ -290,6 +290,7 @@ import os
 import hmac
 import hashlib
 import json
+import re
 from datetime import datetime
 import pytz
 import redis.asyncio as redis
@@ -305,8 +306,8 @@ from tools.notify import send_confirmation, send_interactive_slots, handle_succe
 from tools.booking import voice_book_appointment
 from tools.availability import check_availability
 from tools.followup import verify_followup
-from tools.pool import get_pool          # 👈 NEW: For DB queries
-from db.queries import get_clinic_id     # 👈 NEW: For DB queries
+from tools.pool import get_pool          
+from db.queries import get_clinic_id     
 
 load_dotenv(override=True)
 
@@ -354,13 +355,12 @@ CRITICAL BEHAVIOR RULES:
 WORKFLOW (Execute strictly ONE step at a time):
 - STEP A (Symptoms): Ask what medical problem they are experiencing. STOP and wait.
 - STEP B (Follow-up Check): If they explicitly ask for a follow-up, use `verify_followup_wa` to check eligibility.
-- STEP C (Check Availability): DEDUCE THE SPECIALTY -> Call `check_availability_wa`. Leave `requested_date` BLANK for "next available".
+- STEP C (Check Availability): DEDUCE THE SPECIALTY -> Call `check_availability_wa`. Leave `requested_date` BLANK for "next available". You MUST pass the `language` argument ('english', 'telugu', or 'hindi') based on the current conversation.
 - STEP D (Offer Menu):
-  * The tool will send an interactive menu directly to their WhatsApp. Say ONLY: "I have pulled up the schedule for you! Please tap the menu button above to select your preferred time ☝️"
-- STEP E (Get Details): Once they reply with a time, ask EXACTLY: "Great choice! Please provide the patient's name and 10-digit phone number." STOP AND WAIT.
-- STEP F (Book): Call `book_appointment_wa` AFTER the user texts their real name and phone number.
-  * If the tool returns a warning (like duplicate appointment, expired follow-up, or an EXISTING PATIENT name mismatch), STOP and ask the user exactly what the tool tells you to ask (e.g., asking if they are a new family member).
-  * If the user answers the family member question, call `book_appointment_wa` AGAIN with the `is_same_patient` parameter updated based on their answer.
+  * The tool will send an interactive menu directly to their WhatsApp. Say ONLY: "I have pulled up the schedule for you! Please tap the menu button above to select your preferred time ☝️" (Translate this to their language).
+- STEP E (Get Details): Once they reply with a time, ask for the patient's name and 10-digit phone number. STOP AND WAIT.
+- STEP F (Book): Call `book_appointment_wa` AFTER the user texts their real name and phone number. You MUST pass the `language` argument based on the current conversation.
+  * If the tool returns a warning, STOP and ask the user exactly what the tool tells you to ask.
 - STEP G (Wrap Up): Output EXACTLY the wrap-up message the tool provides.
 
 Reschedule/Cancel Policy: Inform them confirmed appointments cannot be changed via AI. Call the clinic.
@@ -397,6 +397,7 @@ async def receive_whatsapp_message(request: Request):
 
                     message = value["messages"][0]
                     sender_phone = message.get("from")
+                    clean_phone = sender_phone.replace("+91", "").replace("+", "")
 
                     # --- Parse incoming text ---
                     incoming_text = ""
@@ -426,14 +427,13 @@ async def receive_whatsapp_message(request: Request):
                     user_msg_lower = incoming_text.strip().lower()
 
                     # --- Reset / New session detection ---
-                    if user_msg_lower in ["hi", "hello", "hey", "start", "menu", "reset"]:
+                    if user_msg_lower in ["hi", "hello", "hey", "start", "menu", "reset", "హలో", "నమస్కారం"]:
                         if redis_client:
                             await redis_client.delete(f"wa_history:{sender_phone}")
                             await redis_client.delete(f"last_doc_id:{sender_phone}")
                         logger.info(f"🧹 Auto-wiped memory for {sender_phone} due to new greeting.")
 
                         if user_msg_lower == "reset":
-                            clean_phone = sender_phone.replace("+91", "").replace("+", "")
                             await send_confirmation(clean_phone, "🧹 AI Memory wiped! We are starting completely fresh. Say 'Hi'!")
                             return {"status": "success"}
 
@@ -452,7 +452,6 @@ async def receive_whatsapp_message(request: Request):
                     except Exception as e:
                         logger.warning(f"⚠️ Could not fetch specialties for WA prompt: {e}")
 
-                    # Inject the fetched specialties into the prompt
                     system_prompt_text = generate_whatsapp_prompt(specialties_text)
 
                     # ----------------------------------------------------------
@@ -461,13 +460,14 @@ async def receive_whatsapp_message(request: Request):
                     class WAParams:
                         def __init__(self):
                             self.result = None
-
                         async def result_callback(self, result):
                             self.result = result
 
-                    async def check_availability_wa(problem_or_speciality: str, requested_date: str = None):
-                        # 👇 FIXED DOCSTRING: No more hardcoded specialties here!
-                        """Check doctor availability. Map user symptoms to the most relevant specialty from the hospital specialties list provided in your system instructions, or search by exact doctor name."""
+                    async def check_availability_wa(problem_or_speciality: str, requested_date: str = None, language: str = "telugu"):
+                        """Check doctor availability. Pass language as 'english', 'telugu', or 'hindi' based on the conversation."""
+                        if redis_client:
+                            await redis_client.setex(f"wa_lang:{clean_phone}", 86400, language.lower())
+
                         p = WAParams()
                         await check_availability(p, problem_or_speciality, requested_date)
                         result_data = p.result
@@ -476,15 +476,11 @@ async def receive_whatsapp_message(request: Request):
                             slots = result_data.get("all_available_slots", [])
                             doc_id = result_data.get("doctor_id")
                             doc_name = result_data.get("doctor_name")
-                            
                             speciality = result_data.get("speciality", "") 
                             target_date = result_data.get("target_date")
 
                             if slots and doc_id:
-                                clean_phone = sender_phone.replace("+91", "").replace("+", "")
-                                
                                 display_name = f"{doc_name} ({speciality})" if speciality else doc_name
-                                
                                 await send_interactive_slots(clean_phone, display_name, target_date, slots)
                                 
                                 if redis_client:
@@ -492,8 +488,10 @@ async def receive_whatsapp_message(request: Request):
                                 return {"status": "success", "message": "I have sent an interactive menu. Ask them to click it."}
                         return result_data
 
-                    async def verify_followup_wa(phone: str):
+                    async def verify_followup_wa(phone: str, language: str = "telugu"):
                         """Checks if a user is eligible for a free follow-up appointment."""
+                        if redis_client:
+                            await redis_client.setex(f"wa_lang:{clean_phone}", 86400, language.lower())
                         p = WAParams()
                         await verify_followup(p, phone)
                         return p.result
@@ -503,11 +501,15 @@ async def receive_whatsapp_message(request: Request):
                         start_time_iso: str,
                         phone: str,
                         reason: str,
+                        language: str = "telugu",
                         force_book: bool = False,
                         is_followup: str = "unknown",
                         is_same_patient: str = "unknown"
                     ):
-                        """Book the appointment. Pass 'yes' to is_followup if user confirmed 7-day free follow-up."""
+                        """Book the appointment. Pass language as 'english', 'telugu', or 'hindi' based on the conversation."""
+                        if redis_client:
+                            await redis_client.setex(f"wa_lang:{clean_phone}", 86400, language.lower())
+
                         p = WAParams()
                         doctor_id = await redis_client.get(f"last_doc_id:{sender_phone}") if redis_client else None
 
@@ -552,7 +554,7 @@ async def receive_whatsapp_message(request: Request):
                             model='gemini-2.5-flash',
                             contents=chat_history,
                             config=types.GenerateContentConfig(
-                                system_instruction=system_prompt_text, # 👈 UPDATED: Dynamic Prompt
+                                system_instruction=system_prompt_text,
                                 tools=whatsapp_tools
                             )
                         )
@@ -589,7 +591,6 @@ async def receive_whatsapp_message(request: Request):
                         await redis_client.setex(history_key, 86400, json.dumps(storable_history))
 
                     # --- Send reply via WhatsApp ---
-                    clean_phone = sender_phone.replace("+91", "").replace("+", "")
                     await send_confirmation(clean_phone, ai_reply)
 
         return {"status": "success"}

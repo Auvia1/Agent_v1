@@ -1,4 +1,6 @@
-#tools/notify.py
+
+
+# # tools/notify.py
 # import os
 # import pytz
 # import httpx
@@ -16,9 +18,8 @@
 #     # If it's already 11+ digits (like your US number 16315551181 or 91XXXXXXXXXX), leave it alone
 #     return digits_only
 
-
 # async def send_confirmation(phone_number: str, message: str):
-#     """Sends a WhatsApp message using Meta's Official Cloud API."""
+#     """Sends a standard WhatsApp text message (ONLY works if 24-hour user-initiated window is open)."""
 #     meta_access_token = os.getenv("META_ACCESS_TOKEN") or os.getenv("WHATSAPP_ACCESS_TOKEN")
 #     meta_phone_number_id = os.getenv("META_PHONE_NUMBER_ID") or os.getenv("WHATSAPP_PHONE_ID")
 
@@ -49,24 +50,87 @@
 #         async with httpx.AsyncClient() as client:
 #             response = await client.post(url, headers=headers, json=payload)
             
-#             # 👇 DEEP LOGGING: Reveal exactly what Meta is secretly doing
 #             try:
 #                 response_data = response.json()
-#                 logger.info(f"🔍 META RAW RESPONSE: {response_data}")
+#                 logger.info(f"🔍 META RAW TEXT RESPONSE: {response_data}")
 #             except Exception:
-#                 logger.info(f"🔍 META RAW TEXT RESPONSE: {response.text}")
+#                 pass
 
 #             if response.status_code in [200, 201]:
-#                 logger.info(f"✅ Meta WhatsApp message officially accepted for {formatted_number}!")
+#                 logger.info(f"✅ Meta WhatsApp text message accepted for {formatted_number}!")
 #                 return True
                 
-#             logger.error(f"❌ Meta WhatsApp Error {response.status_code}: {response.text}")
+#             logger.error(f"❌ Meta WhatsApp Text Error {response.status_code}: {response.text}")
 #             return False
             
 #     except Exception as e:
 #         logger.error(f"❌ Meta WhatsApp request failed: {e}")
 #         return False
 
+# async def send_whatsapp_template(phone_number: str, template_name: str, language_code: str, body_variables: list, button_variable: str = None):
+#     """Sends an approved Meta WhatsApp Template (Bypasses the 24-hour window restriction)."""
+#     meta_access_token = os.getenv("META_ACCESS_TOKEN") or os.getenv("WHATSAPP_ACCESS_TOKEN")
+#     meta_phone_number_id = os.getenv("META_PHONE_NUMBER_ID") or os.getenv("WHATSAPP_PHONE_ID")
+
+#     if not meta_access_token or not meta_phone_number_id:
+#         logger.error("⚠️ Meta WhatsApp credentials missing in .env")
+#         return False
+
+#     formatted_number = _format_whatsapp_number(phone_number)
+#     url = f"https://graph.facebook.com/v22.0/{meta_phone_number_id}/messages"
+    
+#     headers = {
+#         "Authorization": f"Bearer {meta_access_token}",
+#         "Content-Type": "application/json",
+#     }
+
+#     components = []
+    
+#     # 1. Body Variables
+#     if body_variables:
+#         body_params = [{"type": "text", "text": str(var)} for var in body_variables]
+#         components.append({"type": "body", "parameters": body_params})
+
+#     # 2. Button Variable (If required by template)
+#     if button_variable:
+#         components.append({
+#             "type": "button",
+#             "sub_type": "url",
+#             "index": "0",
+#             "parameters": [{"type": "text", "text": str(button_variable)}]
+#         })
+
+#     payload = {
+#         "messaging_product": "whatsapp",
+#         "to": formatted_number,
+#         "type": "template",
+#         "template": {
+#             "name": template_name,
+#             "language": {"code": language_code},
+#             "components": components
+#         }
+#     }
+
+#     try:
+#         async with httpx.AsyncClient() as client:
+#             response = await client.post(url, headers=headers, json=payload)
+            
+#             try:
+#                 response_data = response.json()
+#                 logger.info(f"🔍 META RAW TEMPLATE RESPONSE: {response_data}")
+#             except Exception:
+#                 pass
+
+#             if response.status_code in [200, 201]:
+#                 logger.info(f"✅ Meta WhatsApp Template '{template_name}' successfully sent to {formatted_number}!")
+#                 return True
+                
+#             logger.error(f"❌ Meta Template Error {response.status_code}: {response.text}")
+#             return False
+            
+#     except Exception as e:
+#         logger.error(f"❌ WhatsApp Template Request Failed: {e}")
+#         return False
 
 # async def send_interactive_slots(phone_number: str, doc_name: str, date_str: str, slots: list):
 #     """Sends a WhatsApp Interactive List message with available time slots."""
@@ -112,13 +176,6 @@
 #     try:
 #         async with httpx.AsyncClient() as client:
 #             response = await client.post(url, json=payload, headers=headers)
-            
-#             # 👇 DEEP LOGGING
-#             try:
-#                 logger.info(f"🔍 META RAW RESPONSE (Slots): {response.json()}")
-#             except:
-#                 pass
-
 #             if response.status_code in [200, 201]:
 #                 logger.info(f"✅ Interactive slot list accepted for {formatted_number}!")
 #                 return True
@@ -135,7 +192,7 @@
 # # 💳 PAYMENT CONFIRMATION HANDLER
 # # ==========================================================
 # async def handle_successful_payment(appointment_id: str):
-#     """Updates the DB to 'paid', generates the Token Number, and triggers the final WhatsApp receipt."""
+#     """Updates the DB to 'paid', generates the Token Number, and triggers the final WhatsApp receipt using the Meta Template."""
 #     try:
 #         pool = get_pool()  
 #         async with pool.acquire() as conn:
@@ -179,21 +236,27 @@
 #             if record:
 #                 ist = pytz.timezone('Asia/Kolkata')
 #                 appt_time = record['appointment_start'].astimezone(ist).strftime('%B %d, %Y at %I:%M %p')
+#                 token_val = str(record['token_number']) if record['token_number'] else "N/A"
 
-#                 token_text = f"🔢 *Token Number:* {record['token_number']}\n" if record['token_number'] else ""
-                
-#                 whatsapp_msg = (
-#                     "✅ *Booking Confirmed & Paid!*\n\n"
-#                     f"👤 *Name:* {record['patient_name']}\n"
-#                     f"📱 *Phone:* {record['phone']}\n"
-#                     f"👨‍⚕️ *Doctor:* {record['doctor_name']}\n"
-#                     f"{token_text}"
-#                     f"📅 *Time:* {appt_time}\n\n"
-#                     "Thank you for choosing us! Please present this message at the front desk."
+#                 # Trigger the approved template 'the_final_paid_receipt_telugu'
+#                 # Variables: {{1}}: Clinic, {{2}}: Name, {{3}}: Phone, {{4}}: Doctor, {{5}}: Token, {{6}}: Time
+#                 template_vars = [
+#                     "Mithra Hospitals",            # {{1}}
+#                     str(record['patient_name']),   # {{2}}
+#                     str(record['phone']),          # {{3}}
+#                     str(record['doctor_name']),    # {{4}}
+#                     token_val,                     # {{5}}
+#                     str(appt_time)                 # {{6}}
+#                 ]
+
+#                 await send_whatsapp_template(
+#                     phone_number=record['phone'],
+#                     template_name="the_final_paid_receipt_telugu", # 👈 MATCHES META
+#                     language_code="en",                            # 👈 META EXPECTS ENGLISH
+#                     body_variables=template_vars
 #                 )
-
-#                 await send_confirmation(record['phone'], whatsapp_msg)
-#                 logger.info(f"✅ Final WhatsApp confirmation sent to {record['phone']} | Token: {record['token_number']}")
+                
+#                 logger.info(f"✅ Final WhatsApp Template receipt triggered for {record['phone']} | Token: {record['token_number']}")
 
 #     except Exception as e:
 #         logger.error(f"❌ Database error processing successful payment: {e}")
@@ -203,18 +266,30 @@ import os
 import pytz
 import httpx
 from loguru import logger
+import redis.asyncio as redis
 from tools.pool import get_pool 
 
 def _format_whatsapp_number(phone_number: str) -> str:
     """Cleans the phone number and safely ensures it has a country code."""
     digits_only = "".join(filter(str.isdigit, str(phone_number)))
     
-    # If strictly 10 digits, assume India and prepend 91
     if len(digits_only) == 10:
         return f"91{digits_only}"
         
-    # If it's already 11+ digits (like your US number 16315551181 or 91XXXXXXXXXX), leave it alone
     return digits_only
+
+# 🟢 NEW HELPER: Fetch dynamic language from Redis
+async def get_user_language(phone: str) -> str:
+    """Fetches the user's active language from Redis. Defaults to telugu."""
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        r = redis.from_url(redis_url, decode_responses=True)
+        clean_phone = phone.replace("+91", "").replace("+", "")
+        lang = await r.get(f"wa_lang:{clean_phone}")
+        await r.aclose()
+        return lang or "telugu"
+    except Exception:
+        return "telugu"
 
 async def send_confirmation(phone_number: str, message: str):
     """Sends a standard WhatsApp text message (ONLY works if 24-hour user-initiated window is open)."""
@@ -435,26 +510,33 @@ async def handle_successful_payment(appointment_id: str):
                 ist = pytz.timezone('Asia/Kolkata')
                 appt_time = record['appointment_start'].astimezone(ist).strftime('%B %d, %Y at %I:%M %p')
                 token_val = str(record['token_number']) if record['token_number'] else "N/A"
+                phone_num = str(record['phone'])
 
-                # Trigger the approved template 'the_final_paid_receipt_telugu'
+                # 🟢 DYNAMIC LANGUAGE FETCH
+                lang = await get_user_language(phone_num)
+                
+                # Make sure these template names explicitly match what is registered in your Meta Developer Portal
+                template_name = f"the_final_paid_receipt_{lang}"
+
+                # Trigger the approved template 
                 # Variables: {{1}}: Clinic, {{2}}: Name, {{3}}: Phone, {{4}}: Doctor, {{5}}: Token, {{6}}: Time
                 template_vars = [
                     "Mithra Hospitals",            # {{1}}
                     str(record['patient_name']),   # {{2}}
-                    str(record['phone']),          # {{3}}
+                    phone_num,                     # {{3}}
                     str(record['doctor_name']),    # {{4}}
                     token_val,                     # {{5}}
                     str(appt_time)                 # {{6}}
                 ]
 
                 await send_whatsapp_template(
-                    phone_number=record['phone'],
-                    template_name="the_final_paid_receipt_telugu", # 👈 MATCHES META
-                    language_code="en",                            # 👈 META EXPECTS ENGLISH
+                    phone_number=phone_num,
+                    template_name=template_name, 
+                    language_code="en",  # Meta requires "en" or "en_US" as the registered language code even if the text translates
                     body_variables=template_vars
                 )
                 
-                logger.info(f"✅ Final WhatsApp Template receipt triggered for {record['phone']} | Token: {record['token_number']}")
+                logger.info(f"✅ Final WhatsApp Template receipt triggered for {phone_num} in {lang.upper()} | Token: {record['token_number']}")
 
     except Exception as e:
         logger.error(f"❌ Database error processing successful payment: {e}")
