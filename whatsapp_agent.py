@@ -286,6 +286,7 @@
 #         logger.error(f"❌ WhatsApp Webhook Error: {e}")
 #         return {"status": "error"}
 # whatsapp_agent.py
+# whatsapp_agent.py
 import os
 import hmac
 import hashlib
@@ -431,6 +432,7 @@ async def receive_whatsapp_message(request: Request):
                         if redis_client:
                             await redis_client.delete(f"wa_history:{sender_phone}")
                             await redis_client.delete(f"last_doc_id:{sender_phone}")
+                            await redis_client.delete(f"last_target_date:{sender_phone}")
                         logger.info(f"🧹 Auto-wiped memory for {sender_phone} due to new greeting.")
 
                         if user_msg_lower == "reset":
@@ -485,6 +487,9 @@ async def receive_whatsapp_message(request: Request):
                                 
                                 if redis_client:
                                     await redis_client.setex(f"last_doc_id:{sender_phone}", 86400, doc_id)
+                                    if target_date:
+                                        await redis_client.setex(f"last_target_date:{sender_phone}", 86400, target_date)
+
                                 return {"status": "success", "message": "I have sent an interactive menu. Ask them to click it."}
                         return result_data
 
@@ -511,10 +516,37 @@ async def receive_whatsapp_message(request: Request):
                             await redis_client.setex(f"wa_lang:{clean_phone}", 86400, language.lower())
 
                         p = WAParams()
-                        doctor_id = await redis_client.get(f"last_doc_id:{sender_phone}") if redis_client else None
+                        doctor_id = None
+                        target_date = None
+                        if redis_client:
+                            doctor_id = await redis_client.get(f"last_doc_id:{sender_phone}")
+                            target_date = await redis_client.get(f"last_target_date:{sender_phone}")
 
                         if not doctor_id:
                             return {"status": "error", "message": "SYSTEM DIRECTIVE: Ask the user to select a doctor/time slot first."}
+
+                        # 🛠️ AUTO-PATCH INCOMPLETE ISO STRINGS
+                        cleaned_time = start_time_iso.strip()
+                        if "T" not in cleaned_time:
+                            ist = pytz.timezone('Asia/Kolkata')
+                            if not target_date:
+                                target_date = datetime.now(ist).strftime('%Y-%m-%d')
+                            
+                            # If it looks like '12:00+05:30', inject the date and 'T' spacer
+                            if "+" in cleaned_time and len(cleaned_time.split("+")[0]) <= 8:
+                                time_part, offset_part = cleaned_time.split("+", 1)
+                                # Append seconds if missing
+                                if len(time_part.strip().split(":")) == 2:
+                                    time_part = f"{time_part.strip()}:00"
+                                cleaned_time = f"{target_date}T{time_part}+{offset_part}"
+                            # If it's just '12:00:00' or '12:00' without offset
+                            elif len(cleaned_time.split(":")) <= 3:
+                                if len(cleaned_time.split(":")) == 2:
+                                    cleaned_time = f"{cleaned_time}:00"
+                                cleaned_time = f"{target_date}T{cleaned_time}+05:30"
+                            
+                            logger.info(f"🔧 Patched incomplete start_time_iso from '{start_time_iso}' to '{cleaned_time}'")
+                            start_time_iso = cleaned_time
 
                         await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient)
                         result_data = p.result
