@@ -108,7 +108,7 @@ from tools.notify import handle_successful_payment
 
 import whatsapp_agent
 import call_agent
-import web_ui_tester # <--- ADDED: Imports your new UI testing file
+# import web_ui_tester # <--- ADDED: Imports your new UI testing file
 
 
 @asynccontextmanager
