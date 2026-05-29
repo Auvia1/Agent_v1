@@ -44,8 +44,8 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 
 # ✅ SARVAM IMPORTS
-from pipecat.services.sarvam.stt import SarvamSTTService
-from pipecat.services.sarvam import SarvamTTSService
+from pipecat.ext.sarvam.stt import SarvamSTTService
+from pipecat.ext.sarvam.tts import SarvamTTSService
 from pipecat.services.google.llm import GoogleLLMService
 
 from tools.pipecat_tools import register_all_tools, get_tools_schema
