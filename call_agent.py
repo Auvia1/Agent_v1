@@ -422,9 +422,9 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         sample_rate=8000, 
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
-            voice="priya",
+            voice="ishita",
             language="te-IN",
-            pace=1.1
+            pace=1.6
         )
     )
 
