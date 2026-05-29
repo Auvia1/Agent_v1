@@ -424,7 +424,7 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
             model="bulbul:v3",
             voice="ishita",
             language="te-IN",
-            pace=1.6
+            pace=1.3
         )
     )
 
