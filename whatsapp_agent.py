@@ -525,27 +525,31 @@ async def receive_whatsapp_message(request: Request):
                         if not doctor_id:
                             return {"status": "error", "message": "SYSTEM DIRECTIVE: Ask the user to select a doctor/time slot first."}
 
-                        # 🛠️ AUTO-PATCH INCOMPLETE ISO STRINGS
+                        # 🛠️ ROBUST TIME PARSER & ISO PATCHER
                         cleaned_time = start_time_iso.strip()
                         if "T" not in cleaned_time:
                             ist = pytz.timezone('Asia/Kolkata')
                             if not target_date:
                                 target_date = datetime.now(ist).strftime('%Y-%m-%d')
                             
-                            # If it looks like '12:00+05:30', inject the date and 'T' spacer
-                            if "+" in cleaned_time and len(cleaned_time.split("+")[0]) <= 8:
-                                time_part, offset_part = cleaned_time.split("+", 1)
-                                # Append seconds if missing
-                                if len(time_part.strip().split(":")) == 2:
-                                    time_part = f"{time_part.strip()}:00"
-                                cleaned_time = f"{target_date}T{time_part}+{offset_part}"
-                            # If it's just '12:00:00' or '12:00' without offset
-                            elif len(cleaned_time.split(":")) <= 3:
-                                if len(cleaned_time.split(":")) == 2:
-                                    cleaned_time = f"{cleaned_time}:00"
-                                cleaned_time = f"{target_date}T{cleaned_time}+05:30"
+                            try:
+                                # Clean off timezone offset if present
+                                time_only = cleaned_time.split("+")[0].strip() if "+" in cleaned_time else cleaned_time.strip()
+                                
+                                # Use dateutil parser to properly convert "12:00 PM" -> "12:00:00"
+                                from dateutil import parser as dt_parser
+                                parsed_time_obj = dt_parser.parse(time_only).time()
+                                formatted_time_str = parsed_time_obj.strftime("%H:%M:%00")
+                                
+                                # Build pristine ISO string
+                                cleaned_time = f"{target_date}T{formatted_time_str}+05:30"
+                                logger.info(f"🔧 Correctly patched time '{start_time_iso}' to '{cleaned_time}'")
+                            except Exception as e:
+                                logger.error(f"❌ Failed to parse time string '{start_time_iso}': {e}")
+                                # Fallback to a safe ISO string so the tool doesn't crash, 
+                                # but it might book at 00:00 if parsing utterly fails.
+                                cleaned_time = f"{target_date}T00:00:00+05:30" 
                             
-                            logger.info(f"🔧 Patched incomplete start_time_iso from '{start_time_iso}' to '{cleaned_time}'")
                             start_time_iso = cleaned_time
 
                         await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient)
