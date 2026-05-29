@@ -182,7 +182,7 @@ async def get_or_create_patient(conn, clinic_id: str, patient_name: str, phone: 
 
 async def get_clinic_id(pool):
     # Hardcoded for demo/testing
-    return "ecef6c1d-83cc-4dcb-8e17-e6a8845965ee"
+    return "2cdd3c18-9537-4efe-8ba6-4e215aa4a2c8"
 
 async def book_new_appointment(pool, clinic_id, doctor_id, patient_name, phone, start_time, end_time, force_book=False, patient_id=None, reason=None, is_followup=False, is_same_patient="unknown", existing_patient_id=None):
     """Inserts the appointment, enforcing capacities dynamically based on DB schema."""

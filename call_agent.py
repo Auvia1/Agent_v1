@@ -79,7 +79,7 @@ async def ensure_redis_client():
 ist_zone = pytz.timezone('Asia/Kolkata')
 live_time_str = datetime.now(ist_zone).strftime('%A, %B %d, %Y at %I:%M %p IST')
 
-VOICE_SYSTEM_PROMPT = f"""Role: Your name is Vayu, the AI Receptionist for Mithra Hospitals.
+VOICE_SYSTEM_PROMPT = f"""Role: Your name is Anjali, the AI Receptionist for Mithra Medicare Hospitals(Bhimavaram).
 CURRENT LIVE TIME: {live_time_str}
 
 You transition strictly through phases. NEVER backtrack.
@@ -381,7 +381,7 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
 
     # --- 3. Initialize Services ---
     
-    # ✅ Fixed STT Deprecation Warning (Moved model and language to Settings)
+    # --- 3. Initialize Services ---
     stt_service = SarvamSTTService(
         api_key=os.getenv("SARVAM_API_KEY"), 
         mode="transcribe",
@@ -391,10 +391,9 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         )
     )
     
-    # ✅ Fixed TTS TypeError (Moved sample_rate out of Settings)
     tts_service = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
-        sample_rate=8000, # 👈 Moved up here!
+        sample_rate=8000, 
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             voice="priya",
@@ -432,9 +431,9 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
 
     async def trigger_greeting():
         await asyncio.sleep(0.2)
-        logger.info(f"[{short_session_id}] 🗣️ Triggering initial Vayu greeting...")
-        vayu_greeting = "నమస్కారం! నేను వాయు, మిత్ర హాస్పిటల్స్ నుండి మాట్లాడుతున్నాను. నేను మీకు ఎలా సహాయపడగలను? మీ ఆరోగ్య సమస్య లేదా లక్షణాలు ఏమిటి?"
-        await task_pipeline.queue_frames([TTSSpeakFrame(vayu_greeting, append_to_context=True)])
+        logger.info(f"[{short_session_id}] 🗣️ Triggering initial Anjali greeting...")
+        anjali_greeting = "నమస్కారం! నేను అంజలి, మిత్ర హాస్పిటల్స్ నుండి మాట్లాడుతున్నాను. నేను మీకు ఎలా సహాయపడగలను? మీ ఆరోగ్య సమస్య లేదా లక్షణాలు ఏమిటి?"
+        await task_pipeline.queue_frames([TTSSpeakFrame(anjali_greeting, append_to_context=True)])
 
     asyncio.create_task(trigger_greeting())
 
