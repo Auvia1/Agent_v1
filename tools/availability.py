@@ -107,6 +107,7 @@
                     
 #     await params.result_callback({"status": "error", "message": "No slots/sessions available for the next 14 days."})
 
+# tools/availability.py
 import pytz
 import datetime
 import difflib
@@ -124,18 +125,31 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
     
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.datetime.now(ist)
+    today_date = now.date()
+    tomorrow_date = today_date + datetime.timedelta(days=1)
 
     target_date = None
     if requested_date:
-        try: target_date = date_parser.parse(requested_date).date()
-        except: pass
+        try: 
+            target_date = date_parser.parse(requested_date).date()
+            
+            # 🟢 CRITICAL BOUNDS GATEKEEPER: Block bookings further out than tomorrow immediately
+            if target_date != today_date and target_date != tomorrow_date:
+                logger.warning(f"📅 Requested date {target_date} is out of bounds (Only today and tomorrow allowed).")
+                return await params.result_callback({
+                    "status": "error", 
+                    "message": "SYSTEM DIRECTIVE: Inform the user gracefully that appointments can only be booked for today or tomorrow. Inform them that online scheduling is restricted to a rolling 48-hour window, and explicitly ask if they would like to look at availability for today or tomorrow instead."
+                })
+        except Exception as e:
+            logger.error(f"Error parsing requested date: {e}")
+            pass
 
     async with pool.acquire() as conn:
         # 1. Determine Clinic Mode
         settings = await conn.fetchrow("SELECT is_slots_needed FROM clinic_settings WHERE clinic_id = $1::uuid", clinic_id)
         is_slots_needed = settings['is_slots_needed'] if settings else False
 
-        # 2. Fuzzy Match Doctor by Name or Speciality
+        # 2. Fetch active doctors for fuzzy matching
         all_doctors_query = "SELECT id, name, speciality FROM doctors WHERE clinic_id = $1::uuid AND is_active = TRUE AND deleted_at IS NULL"
         all_doctors = await conn.fetch(all_doctors_query, clinic_id)
 
@@ -143,25 +157,23 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
         highest_similarity = 0.0
         search_term = problem_or_speciality.lower().replace("dr.", "").replace("dr", "").strip()
 
-        # Check specialty first
+        # Check specialty mapping first
         specialty_match = next((d for d in all_doctors if d['speciality'] and search_term in d['speciality'].lower()), None)
 
         if specialty_match:
             matched_doctor = specialty_match
         else:
-            # Fuzzy match names
+            # Fuzzy match name logic
             for doc in all_doctors:
                 db_doc_name = doc['name'].lower().replace("dr.", "").replace("dr", "").strip()
                 similarity = difflib.SequenceMatcher(None, db_doc_name, search_term).ratio()
-                # 55% match threshold or substring match
                 if similarity > 0.55 or search_term in db_doc_name or db_doc_name in search_term:
                     if similarity > highest_similarity:
                         highest_similarity = similarity
                         matched_doctor = doc
 
         if not matched_doctor:
-            logger.warning(f"No doctor found matching: {problem_or_speciality}")
-            date_context = target_date.strftime('%A, %b %d') if target_date else "today or tomorrow"
+            logger.warning(f"No doctor found matching text criteria: {problem_or_speciality}")
             return await params.result_callback({
                 "status": "error",
                 "message": f"SYSTEM DIRECTIVE: Inform the user that no doctor matching '{problem_or_speciality}' was found. Ask if they want to see a General Physician."
@@ -193,16 +205,17 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
             dow = r['day_of_week']
             if dow not in doc_schedules:
                 doc_schedules[dow] = []
-            # Both tables return index 1=start, 2=end, 3=duration/max_cap
             doc_schedules[dow].append((r['start_time'], r['end_time'], r[3]))
 
-        # 4. Check days for availability
-        for days_checked in range(2): # Check today and tomorrow
+        # Determine target list to loop through (either specific day or both rolling options)
+        days_to_check = [0, 1]
+        if target_date:
+            days_to_check = [0] if target_date == today_date else [1]
+
+        # 4. Check target day window for availability
+        for days_checked in days_to_check:
             check_dt = now + datetime.timedelta(days=days_checked)
             check_date_obj = check_dt.date()
-
-            if target_date and check_date_obj != target_date:
-                continue
 
             pg_dow = (check_date_obj.weekday() + 1) % 7
 
@@ -274,11 +287,9 @@ async def check_availability(params: FunctionCallParams, problem_or_speciality: 
                     })
                     return
 
-    # Fallback if loop completes and finds nothing
-    if target_date:
-        date_str = target_date.strftime('%A, %B %d')
-        err_msg = f"SYSTEM DIRECTIVE: Inform the user that the doctor is fully booked or unavailable on {date_str}. Ask if they would like to check a different date."
-    else:
-        err_msg = "SYSTEM DIRECTIVE: Inform the user that the doctor is fully booked or unavailable for today and tomorrow. Ask them to try calling back later."
-
-    await params.result_callback({"status": "error", "message": err_msg})
+    # Fallback response for inside the 48 hour window boundaries
+    date_label = target_date.strftime('%A, %B %d') if target_date else "today or tomorrow"
+    await params.result_callback({
+        "status": "error", 
+        "message": f"SYSTEM DIRECTIVE: Inform the user that {doc_name} is fully booked or unavailable on {date_label}. Ask if they would like to check the alternative day inside our booking window (today or tomorrow)."
+    })
