@@ -380,17 +380,26 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     )
 
     # --- 3. Initialize Services ---
-    stt_service = SarvamSTTService(api_key=os.getenv("SARVAM_API_KEY"), language="unknown", model="saaras:v3", mode="transcribe")
     
-    # ✅ FIXED: Implemented Sarvam TTS fully with correct sample rate and parameters
+    # ✅ Fixed STT Deprecation Warning (Moved model and language to Settings)
+    stt_service = SarvamSTTService(
+        api_key=os.getenv("SARVAM_API_KEY"), 
+        mode="transcribe",
+        settings=SarvamSTTService.Settings(
+            model="saaras:v3",
+            language="unknown"
+        )
+    )
+    
+    # ✅ Fixed TTS TypeError (Moved sample_rate out of Settings)
     tts_service = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
+        sample_rate=8000, # 👈 Moved up here!
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
             voice="priya",
             language="te-IN",
-            pace=1.1, # Base pace
-            sample_rate=8000 # Optimized for SIP Phone calls
+            pace=1.1
         )
     )
 
