@@ -204,17 +204,19 @@ class AutoLanguageProcessor(FrameProcessor):
             if target_locale != self.active_locale:
                 logger.info(f"[{self.session_identifier}] 🌐 Switching to: {target_locale} | Voice: {target_voice_id}")
                 self.active_locale = target_locale
-
-                await self.push_frame(
-                    TTSUpdateSettingsFrame(
-                        delta=TTSSettings(
-                            language=target_locale,
-                            voice=target_voice_id,
-                            speaking_rate=2 if target_locale == "te-IN" else 0.95
-                        )
-                    ),
-                    direction
-                )
+            logger.info(
+                f"TTS UPDATE -> locale={target_locale}, voice={target_voice_id}, rate={2.0 if target_locale == 'te-IN' else 1.0}"
+            )
+            await self.push_frame(
+                TTSUpdateSettingsFrame(
+                    delta=TTSSettings(
+                        language=target_locale,
+                        voice=target_voice_id,
+                        speaking_rate=2.0 if target_locale == "te-IN" else 1.0
+                    )
+                ),
+                direction
+            )
 
         if isinstance(frame, FunctionCallInProgressFrame):
             time_filler_text = ""
@@ -390,7 +392,8 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     await tts_service._update_settings(
         TTSSettings(
             voice="te-IN-Chirp3-HD-Laomedeia",
-            language="te-IN"
+            language="te-IN",
+            speaking_rate=2.0
         )
     )
     llm_service = GoogleLLMService(api_key=os.getenv("GEMINI_API_KEY"), model="gemini-2.5-flash")
