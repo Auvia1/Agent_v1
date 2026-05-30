@@ -560,6 +560,7 @@
 #         logger.error(f"❌ Razorpay Webhook Error: {e}")
 #         return {"status": "error"}
 # call_agent.py
+# call_agent.py
 import os
 
 # 👉 MAC M-SERIES FIXES: Prevent PyTorch/gRPC thread deadlocks
@@ -568,7 +569,7 @@ os.environ["GRPC_POLL_STRATEGY"] = "poll"
 os.environ["OMP_NUM_THREADS"] = "1" 
 
 import torch
-torch.set_num_threads(1) # 👈 THIS PREVENTS THE mutex.cc LOCK BLOCKING ERROR!
+torch.set_num_threads(1) 
 
 import json
 import re 
@@ -588,10 +589,9 @@ from livekit import api
 from pipecat.transports.livekit.transport import LiveKitTransport, LiveKitParams
 from pipecat.serializers.base_serializer import FrameSerializer
 
-# 🟢 MUST IMPORT TTSStoppedFrame for the hangup processor!
 from pipecat.frames.frames import (
     Frame, AudioRawFrame, CancelFrame,
-    TextFrame, TranscriptionFrame, TTSStoppedFrame,
+    TextFrame, TranscriptionFrame, TTSStoppedFrame, UserStartedSpeakingFrame,
     TTSSpeakFrame, TTSUpdateSettingsFrame, FunctionCallInProgressFrame
 )
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -601,11 +601,9 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 
-# ✅ SILERO
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 
-# ✅ SARVAM IMPORTS
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.services.google.llm import GoogleLLMService
@@ -637,7 +635,7 @@ async def ensure_redis_client():
         redis_conn_obj = None
 
 # ==========================================================
-# 🧠 SYSTEM PROMPT GENERATOR (DYNAMIC)
+# 🧠 SYSTEM PROMPT GENERATOR 
 # ==========================================================
 def generate_system_prompt(specialties_list: str) -> str:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -711,6 +709,28 @@ Wait for the `voice_book_appointment` tool to return a result.
 # ==========================================================
 # 🛠️ PROCESSORS & SERIALIZERS
 # ==========================================================
+
+# 🟢 NEW: Stops the silent TTS crash bug by blocking stray text tokens right after an interruption
+class ContextSilenceFilter(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        self.recently_interrupted = False
+        self.interruption_time = 0.0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self.recently_interrupted = True
+            self.interruption_time = time.time()
+            
+        if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+            # If the user interrupted less than 1.5 seconds ago, swallow the stray LLM text token!
+            if self.recently_interrupted and (time.time() - self.interruption_time < 1.5):
+                logger.debug("🛡️ Swallowing stray text frame to protect Sarvam TTS context ID.")
+                return 
+
+        await super().process_frame(frame, direction)
+        await self.push_frame(frame, direction)
+
 class STTTextCleanerProcessor(FrameProcessor):
     def __init__(self, session_identifier):
         super().__init__()
@@ -793,7 +813,6 @@ class AutoLanguageProcessor(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
-# 🟢 RESTORED: FOOLPROOF HANGUP PROCESSOR
 class CallEndingProcessor(FrameProcessor):
     def __init__(self, task_pipeline):
         super().__init__()
@@ -812,7 +831,6 @@ class CallEndingProcessor(FrameProcessor):
             
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
-
 
 class BillingTracker(FrameProcessor):
     def __init__(self, bot_context, session_identifier):
@@ -836,28 +854,40 @@ class BillingTracker(FrameProcessor):
         dialogue_log_text = json.dumps(self.bot_context.messages)
         total_input_tokens = len(dialogue_log_text) / 4.0
         
-        stt_usd_val = run_duration_min * 0.006
-        tts_usd_val = self.tts_char_count * 0.00003
-        llm_in_usd_val = total_input_tokens * 0.0000003
-        llm_out_usd_val = self.llm_out_tokens * 0.0000025
-        grand_total_usd = stt_usd_val + tts_usd_val + llm_in_usd_val + llm_out_usd_val
+        # 🟢 UPDATED: Document-accurate pricing
+        # STT: Sarvam is ₹30/hour -> ₹0.50/min.
+        stt_inr_val = run_duration_min * 0.50
         
-        rate_usd_per_min = grand_total_usd / run_duration_min if run_duration_min > 0 else 0
-        inr_multiplier = 93.29
-        grand_total_inr = grand_total_usd * inr_multiplier
-        inr_rate_per_min = rate_usd_per_min * inr_multiplier
+        # TTS: Sarvam Bulbul v3 is ₹30/10k chars -> ₹0.003/char
+        tts_inr_val = self.tts_char_count * 0.003
+        
+        # LLM (Gemini 2.5 Flash): In: $0.30/1M, Out: $1.05/1M
+        inr_multiplier = 94.94 # USD to INR conversion
+        llm_in_usd_val = total_input_tokens * (0.30 / 1_000_000)
+        llm_out_usd_val = self.llm_out_tokens * (1.05 / 1_000_000)
+        
+        llm_in_inr_val = llm_in_usd_val * inr_multiplier
+        llm_out_inr_val = llm_out_usd_val * inr_multiplier
+        
+        # LiveKit Transport: $0.01/min (Session) + $0.004/min (Exotel SIP) = $0.014/min
+        transport_usd_val = run_duration_min * 0.014
+        transport_inr_val = transport_usd_val * inr_multiplier
+        
+        grand_total_inr = stt_inr_val + tts_inr_val + llm_in_inr_val + llm_out_inr_val + transport_inr_val
+        inr_rate_per_min = grand_total_inr / run_duration_min if run_duration_min > 0 else 0
 
         logger.info("\n" + "=" * 55)
-        logger.info(f"[{self.session_identifier}] 💰 SESSION BILLING RECEIPT 💰")
+        logger.info(f"[{self.session_identifier}] 💰 DOCUMENT-VERIFIED RECEIPT 💰")
         logger.info("=" * 55)
         logger.info(f"⏱️  Duration:     {run_duration_min:.2f} mins ({run_duration_sec:.0f}s)")
-        logger.info(f"🎙️  STT Cost:     ₹{stt_usd_val * inr_multiplier:.4f} (${stt_usd_val:.4f})")
-        logger.info(f"🧠 LLM In:       ₹{llm_in_usd_val * inr_multiplier:.4f} (~{total_input_tokens:.0f} tokens)")
-        logger.info(f"🧠 LLM Out:      ₹{llm_out_usd_val * inr_multiplier:.4f} (~{self.llm_out_tokens:.0f} tokens)")
-        logger.info(f"🗣️  TTS Cost:     ₹{tts_usd_val * inr_multiplier:.4f} ({self.tts_char_count} chars)")
+        logger.info(f"🎙️  STT Cost:     ₹{stt_inr_val:.4f} (Sarvam: ₹30/hr)")
+        logger.info(f"🗣️  TTS Cost:     ₹{tts_inr_val:.4f} ({self.tts_char_count} chars @ ₹30/10k)")
+        logger.info(f"🧠 LLM In:       ₹{llm_in_inr_val:.4f} (~{total_input_tokens:.0f} tokens @ $0.30/1M)")
+        logger.info(f"🧠 LLM Out:      ₹{llm_out_inr_val:.4f} (~{self.llm_out_tokens:.0f} tokens @ $1.05/1M)")
+        logger.info(f"🌐 Transport:    ₹{transport_inr_val:.4f} (LiveKit+SIP: $0.014/min)")
         logger.info("-" * 55)
-        logger.info(f"💵 TOTAL:        ₹{grand_total_inr:.4f} (${grand_total_usd:.4f})")
-        logger.info(f"📊 PER MIN:      ₹{inr_rate_per_min:.4f} (${rate_usd_per_min:.4f})")
+        logger.info(f"💵 TOTAL:        ₹{grand_total_inr:.4f}")
+        logger.info(f"📊 PER MIN:      ₹{inr_rate_per_min:.4f}")
         logger.info("=" * 55 + "\n")
 
 class PipecatBugFixProcessor(FrameProcessor):
@@ -931,9 +961,8 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     await ensure_redis_client()
     short_session_id = session_call_uuid[:8]
 
-    # --- 0. DYNAMIC CLINIC CONTEXT SETUP ---
     db_pool = get_pool()
-    specialties_text = "General Physician" # Safe fallback
+    specialties_text = "General Physician"
     try:
         if db_pool:
             async with db_pool.acquire() as conn:
@@ -947,10 +976,8 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     except Exception as e:
         logger.warning(f"[{short_session_id}] ⚠️ Could not fetch specialties for prompt: {e}")
 
-    # Inject the fetched specialties into the prompt
     system_prompt_text = generate_system_prompt(specialties_text)
 
-    # --- 1. Generate LiveKit Access Token ---
     livekit_url = os.getenv("LIVEKIT_URL")
     api_key = os.getenv("LIVEKIT_API_KEY")
     api_secret = os.getenv("LIVEKIT_API_SECRET")
@@ -961,7 +988,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         .with_grants(api.VideoGrants(room_join=True, room=room_name)) \
         .to_jwt()
 
-    # ✅ SILERO VAD 
     custom_vad = SileroVADAnalyzer(
         params=VADParams(
             stop_secs=1.5,
@@ -970,7 +996,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         )
     )
 
-    # --- 2. Initialize LiveKit Transport ---
     active_transport = LiveKitTransport(
         room_name=room_name,
         url=livekit_url,
@@ -982,7 +1007,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         )
     )
     
-    # --- 3. Initialize Services ---
     stt_service = SarvamSTTService(
         api_key=os.getenv("SARVAM_API_KEY"), 
         mode="transcribe",
@@ -997,7 +1021,7 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         sample_rate=8000, 
         settings=SarvamTTSService.Settings(
             model="bulbul:v3",
-            voice="priya",  # 🟢 RESTORED: Fixed from 'ishita' to prevent API crash!
+            voice="priya",  
             language="te-IN",
             pace=1.2
         )
@@ -1008,13 +1032,11 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     register_all_tools(llm_service)
 
     sys_context = LLMContext(messages=[{"role": "system", "content": system_prompt_text}], tools=get_tools_schema())
-
     context_aggregator = LLMContextAggregatorPair(sys_context)
-
     bill_tracker = BillingTracker(sys_context, short_session_id)
     
-    # 🟢 Initialize the hangup processor
     call_ender = CallEndingProcessor(task_pipeline=None) 
+    silence_filter = ContextSilenceFilter() # 🟢 NEW: Instantiated
 
     # --- 4. Pipeline Setup ---
     pipeline = Pipeline([
@@ -1024,17 +1046,16 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
         context_aggregator.user(),
         llm_service,
         bill_tracker,
+        silence_filter, # 🟢 NEW: Blocks stray tokens from crashing TTS during interruptions
         AutoLanguageProcessor(short_session_id),
         tts_service,
-        call_ender, # 🟢 Restored!
+        call_ender,
         PipecatBugFixProcessor(),
         active_transport.output(),
         context_aggregator.assistant()
     ])
 
     task_pipeline = PipelineTask(pipeline, params=PipelineParams(audio_in_sample_rate=8000, audio_out_sample_rate=8000))
-    
-    # 🟢 Link the task to the ender
     call_ender.task_pipeline = task_pipeline
 
     async def trigger_greeting():
@@ -1058,7 +1079,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     except Exception:
         pass
 
-    # 1. IMMEDIATE HANGUP (Safe Cleanup Pattern)
     logger.info(f"🧹 Deleting LiveKit room '{room_name}' to force SIP hangup...")
     api_client = api.LiveKitAPI(livekit_url, api_key, api_secret)
     try:
@@ -1069,7 +1089,6 @@ async def run_bot(room_name: str, session_call_uuid: str = "livekit_call", inbou
     finally:
         await api_client.aclose()
 
-    # 2. BACKGROUND TASKS
     logger.info("⚙️ Running post-call background tasks (Billing & DB)...")
     bill_tracker.generate_receipt()
     final_call_duration = time.time() - bill_tracker.timer_start
@@ -1085,7 +1104,6 @@ async def livekit_webhook(request: Request):
         event_type = payload.get("event")
         room_name = payload.get("room", {}).get("name")
 
-        # 🟢 1. Handle New Calls
         if event_type == "room_started":
             room_sid = payload.get("room", {}).get("sid", "livekit_call")
             logger.info(f"🟢 LiveKit Room Started: {room_name}. Spinning up AI Agent...")
@@ -1095,7 +1113,6 @@ async def livekit_webhook(request: Request):
                 inbound_caller_id="Exotel_SIP_Caller"
             ))
 
-        # 🔴 2. The Zombie Killer: Force close room when human leaves
         elif event_type == "participant_left":
             participant_identity = payload.get("participant", {}).get("identity", "")
             if "mithra-ai" not in participant_identity:
