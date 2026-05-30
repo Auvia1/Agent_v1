@@ -903,9 +903,55 @@ class PipecatBugFixProcessor(FrameProcessor):
 # ==========================================================
 # 💾 DB SAVING HELPER
 # ==========================================================
-async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_runtime_sec: float, msg_history: list):
-    logger.info(f"💾 Starting DB save for call {session_call_uuid}...")
+async def init_call_log(session_call_uuid: str, inbound_caller_id: str):
+    logger.info(f"💾 Creating initial DB save for call {session_call_uuid}...")
     try:
+        db_conn_pool = get_pool()
+        if not db_conn_pool:
+            logger.error("❌ DB pool not available — cannot create initial call log.")
+            return None
+
+        from db.queries import get_clinic_id
+        target_clinic_id = await get_clinic_id(db_conn_pool)
+        if not target_clinic_id:
+            logger.error("❌ Could not resolve clinic_id — cannot create initial call log.")
+            return None
+
+        import datetime as dt
+        call_start_time = dt.datetime.now(dt.timezone.utc)
+
+        async with db_conn_pool.acquire() as conn:
+            call_id = await conn.fetchval(
+                """
+                INSERT INTO calls
+                    (clinic_id, type, caller, agent_type, duration, ai_summary, time)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+                """,
+                str(target_clinic_id),
+                "incoming",
+                inbound_caller_id,
+                "ai",
+                0,
+                None,
+                call_start_time,
+            )
+        logger.info(f"✅ Initial Call log created | ID: {call_id}")
+        return str(call_id) if call_id else None
+    except Exception as e:
+        logger.error(f"❌ Failed to create initial call log: {e}", exc_info=True)
+        return None
+
+
+async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_runtime_sec: float, msg_history: list):
+    logger.info(f"💾 Finalizing DB save for call {session_call_uuid}...")
+    try:
+        # ── Retrieve db_call_id from Redis ───────────────────────────────────────
+        import os, redis.asyncio as redis
+        redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+        db_call_id = await redis_client.get(f"call_log_id:{session_call_uuid}")
+        await redis_client.aclose()
+
         # ── Build transcript ─────────────────────────────────────────────────────
         chat_lines = []
         for hist_item in msg_history:
@@ -943,38 +989,28 @@ async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_run
             response = await asyncio.to_thread(summarizer_model.generate_content, summary_prompt)
             llm_generated_synopsis = response.text.strip() if response else "No summary generated."
 
-        # ── Save to calls table ──────────────────────────────────────────────────
+        # ── Update calls table ──────────────────────────────────────────────────
         db_conn_pool = get_pool()
         if not db_conn_pool:
-            logger.error("❌ DB pool not available — cannot save call log.")
+            logger.error("❌ DB pool not available — cannot finalize call log.")
             return
-
-        from db.queries import get_clinic_id
-        target_clinic_id = await get_clinic_id(db_conn_pool)
-        if not target_clinic_id:
-            logger.error("❌ Could not resolve clinic_id — cannot save call log.")
-            return
-
-        # Compute the actual call start time (now minus call duration)
-        import datetime as dt
-        call_start_time = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=call_runtime_sec)
 
         async with db_conn_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO calls
-                    (clinic_id, type, caller, agent_type, duration, ai_summary, time)
-                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
-                """,
-                str(target_clinic_id),
-                "incoming",
-                inbound_caller_id,
-                "ai",
-                int(call_runtime_sec),
-                llm_generated_synopsis,
-                call_start_time,
-            )
-        logger.info(f"✅ Call log saved | Caller: {inbound_caller_id} | Duration: {int(call_runtime_sec)}s | Summary: {llm_generated_synopsis}")
+            if db_call_id:
+                await conn.execute(
+                    """
+                    UPDATE calls
+                    SET duration = $1, ai_summary = $2, updated_at = NOW()
+                    WHERE id = $3::uuid
+                    """,
+                    int(call_runtime_sec),
+                    llm_generated_synopsis,
+                    db_call_id
+                )
+                logger.info(f"✅ Call log finalized | ID: {db_call_id} | Duration: {int(call_runtime_sec)}s | Summary: {llm_generated_synopsis}")
+            else:
+                logger.warning(f"⚠️ db_call_id not found in Redis for {session_call_uuid}. Skipping update.")
+                
     except Exception as e:
         logger.error(f"❌ Failed to save call log: {e}", exc_info=True)
 
@@ -1131,11 +1167,38 @@ async def livekit_webhook(request: Request):
         if event_type == "room_started":
             room_sid = payload.get("room", {}).get("sid", "livekit_call")
             logger.info(f"🟢 LiveKit Room Started: {room_name}. Spinning up AI Agent...")
+            
+            # Create initial call record in database
+            db_call_id = await init_call_log(room_sid, "Exotel_SIP_Caller")
+            if db_call_id:
+                import os, redis.asyncio as redis
+                redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+                await redis_client.setex(f"call_log_id:{room_sid}", 3600, db_call_id)
+                await redis_client.aclose()
+
             asyncio.create_task(run_bot(
                 room_name=room_name,
                 session_call_uuid=room_sid,
                 inbound_caller_id="Exotel_SIP_Caller"
             ))
+
+        elif event_type == "participant_joined":
+            participant_identity = payload.get("participant", {}).get("identity", "")
+            if "mithra-ai" not in participant_identity:
+                room_sid = payload.get("room", {}).get("sid", "")
+                caller_number = participant_identity.replace("sip:", "").replace("sip_", "")
+                
+                import os, redis.asyncio as redis
+                redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+                db_call_id = await redis_client.get(f"call_log_id:{room_sid}")
+                await redis_client.aclose()
+                
+                if db_call_id:
+                    db_conn_pool = get_pool()
+                    if db_conn_pool:
+                        async with db_conn_pool.acquire() as conn:
+                            await conn.execute("UPDATE calls SET caller = $1 WHERE id = $2::uuid", caller_number, db_call_id)
+                            logger.info(f"📞 Updated call {db_call_id} caller to {caller_number}")
 
         elif event_type == "participant_left":
             participant_identity = payload.get("participant", {}).get("identity", "")
