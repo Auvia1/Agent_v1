@@ -43,20 +43,19 @@ async def cancel_unpaid_appointment(appointment_id: str):
     except Exception as e:
         logger.error(f"❌ Error cancelling unpaid appointment: {e}")
 
-async def notify_live_activity(clinic_id: str, appointment_id: str, patient_name: str, appt_time: str):
+async def notify_live_activity(clinic_id: str, appointment_id: str, patient_name: str, doctor_name: str, reason: str, channel: str = "WhatsApp"):
     """Sends a POST request to the backend's live activity WebSocket broadcaster."""
     try:
         backend_url = os.getenv("BACKEND_API_URL", "http://localhost:4002")
         payload = {
             "clinic_id": str(clinic_id),
-            "event_type": "APPOINTMENT_BOOKED",
-            "title": f"AI booked an appointment for {patient_name}",
+            "event_type": "agent_booking",
+            "title": f"Agent booked {patient_name} with Dr. {doctor_name}",
             "entity_type": "appointment",
             "entity_id": str(appointment_id),
             "meta": {
-                "patient_name": patient_name,
-                "channel": "voice_bot",
-                "time": appt_time
+                "reason": reason,
+                "channel": channel
             }
         }
         async with aiohttp.ClientSession() as session:
@@ -89,13 +88,16 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
 
         pool = get_pool()
         async with pool.acquire() as conn:
-            clinic_id_query = "SELECT clinic_id FROM doctors WHERE id = $1::uuid"
-            clinic_id = await conn.fetchval(clinic_id_query, doctor_id)
+            doc_query = "SELECT clinic_id, name FROM doctors WHERE id = $1::uuid"
+            doc_data = await conn.fetchrow(doc_query, doctor_id)
             
-            if not clinic_id:
+            if not doc_data or not doc_data['clinic_id']:
                 logger.error("🚨 Execution aborted: clinic_id is None (Doctor not found).")
                 await params.result_callback({"status": "error", "message": "SYSTEM DIRECTIVE: The doctor ID was invalid. Please apologize to the user and ask them to select the time again."})
                 return
+            
+            clinic_id = doc_data['clinic_id']
+            doctor_name = doc_data['name']
             
             patient_id = await get_or_create_patient(conn, str(clinic_id), clean_name, clean_phone, is_same_patient, existing_patient_id)
 
@@ -122,7 +124,7 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
 
         # Broadcast live activity to the frontend WebSocket
         asyncio.create_task(notify_live_activity(
-            clinic_id, str(appt_id), clean_name, appt_time_str
+            clinic_id, str(appt_id), clean_name, doctor_name, reason
         ))
 
         if is_followup:
