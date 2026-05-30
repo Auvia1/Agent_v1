@@ -906,6 +906,7 @@ class PipecatBugFixProcessor(FrameProcessor):
 async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_runtime_sec: float, msg_history: list):
     logger.info(f"💾 Starting DB save for call {session_call_uuid}...")
     try:
+        # ── Build transcript ─────────────────────────────────────────────────────
         chat_lines = []
         for hist_item in msg_history:
             speaker_role = "AI" if hist_item.get('role') == 'model' else "Patient"
@@ -920,9 +921,10 @@ async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_run
                         content_str += sub_part
             if content_str.strip():
                 chat_lines.append(f"{speaker_role}: {content_str.strip()}")
-        
+
         full_call_transcript = "\n".join(chat_lines)
-        
+
+        # ── Generate AI summary ──────────────────────────────────────────────────
         if not chat_lines:
             llm_generated_synopsis = "Call connected but no speech detected."
         else:
@@ -941,16 +943,38 @@ async def save_call_log(session_call_uuid: str, inbound_caller_id: str, call_run
             response = await asyncio.to_thread(summarizer_model.generate_content, summary_prompt)
             llm_generated_synopsis = response.text.strip() if response else "No summary generated."
 
+        # ── Save to calls table ──────────────────────────────────────────────────
         db_conn_pool = get_pool()
-        if not db_conn_pool: return
+        if not db_conn_pool:
+            logger.error("❌ DB pool not available — cannot save call log.")
+            return
+
+        from db.queries import get_clinic_id
+        target_clinic_id = await get_clinic_id(db_conn_pool)
+        if not target_clinic_id:
+            logger.error("❌ Could not resolve clinic_id — cannot save call log.")
+            return
+
+        # Compute the actual call start time (now minus call duration)
+        import datetime as dt
+        call_start_time = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=call_runtime_sec)
+
         async with db_conn_pool.acquire() as conn:
-            target_clinic_id = await conn.fetchval("SELECT id FROM clinics LIMIT 1")
-            if not target_clinic_id: return
-            await conn.execute("""
-                INSERT INTO calls (clinic_id, type, caller, agent_type, duration, ai_summary)
-                VALUES ($1, 'incoming', $2, 'ai', $3, $4)
-            """, target_clinic_id, inbound_caller_id, int(call_runtime_sec), llm_generated_synopsis)
-        logger.info(f"✅ Call Log Saved | Summary: {llm_generated_synopsis}")
+            await conn.execute(
+                """
+                INSERT INTO calls
+                    (clinic_id, type, caller, agent_type, duration, ai_summary, time)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+                """,
+                str(target_clinic_id),
+                "incoming",
+                inbound_caller_id,
+                "ai",
+                int(call_runtime_sec),
+                llm_generated_synopsis,
+                call_start_time,
+            )
+        logger.info(f"✅ Call log saved | Caller: {inbound_caller_id} | Duration: {int(call_runtime_sec)}s | Summary: {llm_generated_synopsis}")
     except Exception as e:
         logger.error(f"❌ Failed to save call log: {e}", exc_info=True)
 
