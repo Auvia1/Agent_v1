@@ -43,31 +43,53 @@ async def cancel_unpaid_appointment(appointment_id: str):
     except Exception as e:
         logger.error(f"❌ Error cancelling unpaid appointment: {e}")
 
-async def notify_live_activity(clinic_id: str, appointment_id: str, patient_name: str, doctor_name: str, reason: str, channel: str = "WhatsApp"):
+async def notify_live_activity(
+    clinic_id: str,
+    appointment_id: str,
+    patient_name: str,
+    doctor_name: str,
+    doctor_id: str,
+    patient_id,
+    reason: str,
+    appointment_start: str,
+    appointment_end: str,
+    token_number,
+    booking_model: str = "slot-based",
+    channel: str = "WhatsApp",
+):
     """Sends a POST request to the backend's live activity WebSocket broadcaster."""
     try:
         backend_url = os.getenv("BACKEND_API_URL", "http://localhost:4002")
         payload = {
             "clinic_id": str(clinic_id),
             "event_type": "agent_booking",
-            "title": f"Agent booked {patient_name} with Dr. {doctor_name}",
+            "title": f"Agent booked {patient_name} with Dr. {doctor_name} ({channel})",
             "entity_type": "appointment",
             "entity_id": str(appointment_id),
             "meta": {
+                "appointment_id": str(appointment_id),
+                "appointment_start": appointment_start,
+                "appointment_end": appointment_end,
+                "doctor_id": str(doctor_id),
+                "doctor_name": doctor_name,
+                "patient_id": str(patient_id) if patient_id else None,
+                "patient_name": patient_name,
                 "reason": reason,
-                "channel": channel
+                "booking_model": booking_model,
+                "token_number": token_number,
+                "channel": channel,
             }
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{backend_url}/api/activity", json=payload, timeout=2.0) as resp:
                 if resp.status == 200:
-                    logger.info(f"📡 Broadcasted Live Activity for {patient_name}")
+                    logger.info(f"📡 Broadcasted Live Activity for {patient_name} via {channel}")
                 else:
                     logger.warning(f"⚠️ Failed to broadcast Live Activity: {resp.status}")
     except Exception as e:
         logger.warning(f"⚠️ Error broadcasting Live Activity: {e}")
 
-async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: bool = False, is_same_patient: str = "unknown", existing_patient_id: str = None):
+async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: bool = False, is_same_patient: str = "unknown", existing_patient_id: str = None, channel: str = "WhatsApp"):
     """Internal helper that performs the actual database insertion, Redis locking, and Meta notifications."""
     clean_name = patient_name.strip()
     clean_phone = "".join(filter(str.isdigit, str(phone)))
@@ -122,9 +144,23 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
         appt_time_str = start_dt.astimezone(ist).strftime('%I:%M %p')
         appt_date_str = start_dt.astimezone(ist).strftime('%B %d')
 
+        # Derive booking model from whether slot-based scheduling is needed
+        booking_model = "slot-based" if is_slots_needed else "token-based"
+
         # Broadcast live activity to the frontend WebSocket
         asyncio.create_task(notify_live_activity(
-            clinic_id, str(appt_id), clean_name, doctor_name, reason
+            clinic_id=clinic_id,
+            appointment_id=str(appt_id),
+            patient_name=clean_name,
+            doctor_name=doctor_name,
+            doctor_id=doctor_id,
+            patient_id=patient_id,
+            reason=reason,
+            appointment_start=start_dt.isoformat(),
+            appointment_end=end_dt.isoformat(),
+            token_number=token_number,
+            booking_model=booking_model,
+            channel=channel,
         ))
 
         if is_followup:
@@ -168,7 +204,7 @@ async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_n
 # ==========================================================
 # 🧠 MAIN LLM TOOL ENTRYPOINT (Smart Intercept)
 # ==========================================================
-async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: str = "unknown", is_same_patient: str = "unknown"):
+async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: str = "unknown", is_same_patient: str = "unknown", channel: str = "WhatsApp"):
     """Gatekeeper — runs safety checks before actual booking."""
     bad_names = ["john doe", "test", "demo", "placeholder", "user"]
     if patient_name.lower().strip() in bad_names:
@@ -301,7 +337,7 @@ async def voice_book_appointment(params: FunctionCallParams, doctor_id: str, pat
         return
 
     # Passed all checks → Proceed to actual booking
-    await _execute_booking(params, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup_bool, is_same_patient, existing_patient_id)
+    await _execute_booking(params, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup_bool, is_same_patient, existing_patient_id, channel)
     
 # tools/booking.py
 # import os

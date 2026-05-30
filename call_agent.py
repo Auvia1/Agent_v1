@@ -694,11 +694,11 @@ If 10 digits, you MUST repeat it back to them digit-by-digit to confirm. Say: "Y
 
 PHASE 4 (The Silent Trigger):
 ONLY AFTER the user provides ANY form of confirmation (e.g., "Yes", "Correct", "Avunu", "Thanks", "Okay"), YOU MUST STOP SPEAKING.
-Immediately call `voice_book_appointment` using ONLY the exact name and phone number provided. 
+Immediately call `voice_agent_book_appointment` using ONLY the exact name and phone number provided. 
 CRITICAL: Emit ZERO characters of text. DO NOT say "Okay" or repeat the name again.
 
 PHASE 5 (Confirmation & Persistence):
-Wait for the `voice_book_appointment` tool to return a result.
+Wait for the `voice_agent_book_appointment` tool to return a result.
 - IF SUCCESS: Inform the patient with the native translation of: "A tentative appointment has been booked. Please click the payment link on WhatsApp and do the payment under 15 minutes."
 - If the user asks for booking details after this, accurately state the doctor's name and the time based on the data you sent to the booking tool.
 - IF ERROR: Read the system error directive exactly as written.
@@ -802,7 +802,7 @@ class AutoLanguageProcessor(FrameProcessor):
 
         if isinstance(frame, FunctionCallInProgressFrame):
             time_filler_text = ""
-            if frame.function_name == "voice_book_appointment":
+            if frame.function_name == "voice_agent_book_appointment":
                 time_filler_text = "ఒక్క నిమిషం" if self.active_locale == "te-IN" else "एक मिनट" if self.active_locale == "hi-IN" else "One moment"
             elif frame.function_name in ["check_availability", "query_clinic_faq"]:
                 time_filler_text = "చూస్తున్నాను" if self.active_locale == "te-IN" else "चेक कर रही हूँ" if self.active_locale == "hi-IN" else "Checking"

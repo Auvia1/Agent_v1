@@ -14,6 +14,11 @@ from tools.booking import voice_book_appointment
 from tools.followup import verify_followup
 from tools.faq import query_clinic_faq  # ✅ NEW: Imported FAQ tool
 
+# Wrapper for the voice/call agent — injects channel="Voice" transparently
+async def voice_agent_book_appointment(params, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: str = "unknown", is_same_patient: str = "unknown"):
+    """Book the appointment via the voice call channel."""
+    await voice_book_appointment(params, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient, channel="Voice")
+
 # ==========================================================
 # 🛑 END CALL & LANGUAGE TOOLS 
 # ==========================================================
@@ -89,7 +94,7 @@ verify_followup_schema = FunctionSchema(
 )
 
 voice_book_appointment_schema = FunctionSchema(
-    name="voice_book_appointment",
+    name="voice_agent_book_appointment",
     description="Books the appointment in the database. CRITICAL INSTRUCTION: When you call this tool, your response MUST consist ONLY of the function call.",
     properties={
         "doctor_id": {"type": "string", "description": "The exact 36-character UUID of the doctor."},
@@ -123,7 +128,7 @@ switch_language_schema = FunctionSchema(
 def register_all_tools(llm):
     llm.register_direct_function(check_availability, cancel_on_interruption=False)
     llm.register_direct_function(verify_followup, cancel_on_interruption=False)
-    llm.register_direct_function(voice_book_appointment, cancel_on_interruption=False)
+    llm.register_direct_function(voice_agent_book_appointment, cancel_on_interruption=False)  # ✅ Uses Voice channel wrapper
     llm.register_direct_function(query_clinic_faq, cancel_on_interruption=False) # ✅ Registered
     llm.register_direct_function(switch_language, cancel_on_interruption=False)
     llm.register_direct_function(end_call, cancel_on_interruption=False)

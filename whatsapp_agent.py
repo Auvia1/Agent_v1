@@ -552,7 +552,7 @@ async def receive_whatsapp_message(request: Request):
                             
                             start_time_iso = cleaned_time
 
-                        await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient)
+                        await voice_book_appointment(p, doctor_id, patient_name, start_time_iso, phone, reason, force_book, is_followup, is_same_patient, channel="WhatsApp")
                         result_data = p.result
 
                         if result_data and result_data.get("status") == "success":
