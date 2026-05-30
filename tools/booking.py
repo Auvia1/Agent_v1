@@ -57,37 +57,40 @@ async def notify_live_activity(
     booking_model: str = "slot-based",
     channel: str = "WhatsApp",
 ):
-    """Sends a POST request to the backend's live activity WebSocket broadcaster."""
+    """Writes an activity_log row directly via the agent's DB pool (avoids WSL→Windows HTTP hop)."""
+    import json
     try:
-        backend_url = os.getenv("BACKEND_API_URL", "http://localhost:4002")
-        payload = {
-            "clinic_id": str(clinic_id),
-            "event_type": "agent_booking",
-            "title": f"Agent booked {patient_name} with Dr. {doctor_name} ({channel})",
-            "entity_type": "appointment",
-            "entity_id": str(appointment_id),
-            "meta": {
-                "appointment_id": str(appointment_id),
-                "appointment_start": appointment_start,
-                "appointment_end": appointment_end,
-                "doctor_id": str(doctor_id),
-                "doctor_name": doctor_name,
-                "patient_id": str(patient_id) if patient_id else None,
-                "patient_name": patient_name,
-                "reason": reason,
-                "booking_model": booking_model,
-                "token_number": token_number,
-                "channel": channel,
-            }
+        pool = get_pool()
+        meta = {
+            "appointment_id":    str(appointment_id),
+            "appointment_start": appointment_start,
+            "appointment_end":   appointment_end,
+            "doctor_id":         str(doctor_id),
+            "doctor_name":       doctor_name,
+            "patient_id":        str(patient_id) if patient_id else None,
+            "patient_name":      patient_name,
+            "reason":            reason,
+            "booking_model":     booking_model,
+            "token_number":      token_number,
+            "channel":           channel,
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{backend_url}/api/activity", json=payload, timeout=2.0) as resp:
-                if resp.status == 200:
-                    logger.info(f"📡 Broadcasted Live Activity for {patient_name} via {channel}")
-                else:
-                    logger.warning(f"⚠️ Failed to broadcast Live Activity: {resp.status}")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO activity_log
+                    (clinic_id, event_type, title, entity_type, entity_id, meta)
+                VALUES ($1::uuid, $2, $3, $4, $5::uuid, $6::jsonb)
+                """,
+                str(clinic_id),
+                "agent_booking",
+                f"Agent booked {patient_name} with Dr. {doctor_name} ({channel})",
+                "appointment",
+                str(appointment_id),
+                json.dumps(meta),
+            )
+        logger.info(f"📡 Activity log written for {patient_name} via {channel}")
     except Exception as e:
-        logger.warning(f"⚠️ Error broadcasting Live Activity: {e}")
+        logger.warning(f"⚠️ Failed to write activity log: {e}")
 
 async def _execute_booking(params: FunctionCallParams, doctor_id: str, patient_name: str, start_time_iso: str, phone: str, reason: str, force_book: bool = False, is_followup: bool = False, is_same_patient: str = "unknown", existing_patient_id: str = None, channel: str = "WhatsApp"):
     """Internal helper that performs the actual database insertion, Redis locking, and Meta notifications."""
